@@ -1,0 +1,793 @@
+Project
+
+===== 目录结构 =====
+
+Test-9r5zrp/
+├── asset/
+│   ├── hsg_to_sv_down.bin
+│   └── hsv_to_gray_down.bin
+├── images/
+│   ├── icon@1x.png
+│   └── icon@2x.png
+├── old_version/
+├── index.html
+├── index.js
+├── manifest.json
+└── style.css
+
+===== 项目代码 =====
+
+---=== index.html ===---
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="pickerContainer">
+      <div class="svArea" id="svArea">
+        <canvas id="svCanvas"></canvas>
+        <div id="svMarker" class="marker-circle"></div>
+      </div>
+      <div class="hueArea" id="hueArea">
+        <canvas id="hueCanvas"></canvas>
+        <div id="hueMarker" class="marker-hue"></div>
+      </div>
+    </div>
+    <div class="colorInfo">
+      <div class="swatch" id="swatch"></div>
+      <div class="colorText" id="colorText">H:0 S:100% V:100%</div>
+      <button
+        id="debugBtn"
+        style="margin-left: auto; padding: 3px 8px; cursor: pointer"
+      >
+        ----
+      </button>
+    </div>
+    <script src="index.js"></script>
+  </body>
+</html>
+
+---=== index.js ===---
+const { core, app, action } = require("photoshop");
+const { entrypoints } = require("uxp");
+
+let currentHue = 0;
+let currentS = 1;
+let currentV = 1;
+let cycleState = 0;
+let targetGray = null;
+let isUpdatingFromPlugin = false;
+let colorCheckTimer = null;
+let isBgRedrawScheduled = false;
+let initialized = false;
+let svArea, hueArea, svCanvas, hueCanvas, svCtx, hueCtx;
+let svMarker, hueMarker, swatch, colorText, debugBtn; 
+
+const LUT = {
+  gray: null,
+  sv: null,
+  ready: false,
+  H: 45,
+  S: 128,
+  G: 128,
+  HF: 4,
+  SF: 2,
+  async init() {
+    try {
+      const grayResp = await fetch("./asset/hsv_to_gray_down.bin");
+      const grayBuf = await grayResp.arrayBuffer();
+      await new Promise((r) => setTimeout(r, 0));
+      const svResp = await fetch("./asset/hsg_to_sv_down.bin");
+      const svBuf = await svResp.arrayBuffer();
+      await new Promise((r) => setTimeout(r, 0));
+      this.gray = new Uint8Array(grayBuf);
+      this.sv = new Uint8Array(svBuf);
+      this.ready = true;
+      redraw(true);
+    } catch (e) {
+      console.warn("❌ LUT load failed:", e);
+    }
+  },
+  _lerp3(arr, d0, d1, d2, f0, f1, f2) {
+    const i0 = f0 | 0,
+      i1 = f1 | 0,
+      i2 = f2 | 0;
+    const j0 = Math.min(i0 + 1, d0 - 1);
+    const j1 = Math.min(i1 + 1, d1 - 1);
+    const j2 = Math.min(i2 + 1, d2 - 1);
+    const a = f0 - i0,
+      b = f1 - i1,
+      c = f2 - i2;
+    const x = 1 - a,
+      y = 1 - b,
+      z = 1 - c;
+    const p = (a0, a1, a2) => a0 * d1 * d2 + a1 * d2 + a2;
+    return (
+      arr[p(i0, i1, i2)] * x * y * z +
+      arr[p(j0, i1, i2)] * a * y * z +
+      arr[p(i0, j1, i2)] * x * b * z +
+      arr[p(j0, j1, i2)] * a * b * z +
+      arr[p(i0, i1, j2)] * x * y * c +
+      arr[p(j0, i1, j2)] * a * y * c +
+      arr[p(i0, j1, j2)] * x * b * c +
+      arr[p(j0, j1, j2)] * a * b * c
+    );
+  },
+  _lerp3c2(arr, d0, d1, d2, f0, f1, f2) {
+    const i0 = f0 | 0,
+      i1 = f1 | 0,
+      i2 = f2 | 0;
+    const j0 = Math.min(i0 + 1, d0 - 1);
+    const j1 = Math.min(i1 + 1, d1 - 1);
+    const j2 = Math.min(i2 + 1, d2 - 1);
+    const a = f0 - i0,
+      b = f1 - i1,
+      c = f2 - i2;
+    const x = 1 - a,
+      y = 1 - b,
+      z = 1 - c;
+    const p = (a0, a1, a2, ch) => (a0 * d1 * d2 + a1 * d2 + a2) * 2 + ch;
+    const res = [0, 0];
+    for (let ch = 0; ch < 2; ch++) {
+      res[ch] = Math.round(
+        arr[p(i0, i1, i2, ch)] * x * y * z +
+          arr[p(j0, i1, i2, ch)] * a * y * z +
+          arr[p(i0, j1, i2, ch)] * x * b * z +
+          arr[p(j0, j1, i2, ch)] * a * b * z +
+          arr[p(i0, i1, j2, ch)] * x * y * c +
+          arr[p(j0, i1, j2, ch)] * a * y * c +
+          arr[p(i0, j1, j2, ch)] * x * b * c +
+          arr[p(j0, j1, j2, ch)] * a * b * c,
+      );
+    }
+    return res;
+  },
+  _hf(hueDeg) {
+    return Math.max(0, Math.min(this.H - 1, hueDeg / (2 * this.HF)));
+  },
+  _sf(v01) {
+    return Math.max(0, Math.min(this.S - 1, (v01 * 255) / this.SF));
+  },
+  _gf(gray) {
+    return Math.max(0, Math.min(this.G - 1, gray / this.SF));
+  },
+  grayFromHsv(hueDeg, s01, v01) {
+    if (!this.ready) return null;
+    return this._lerp3(
+      this.gray,
+      this.H,
+      this.S,
+      this.S,
+      this._hf(hueDeg),
+      this._sf(s01),
+      this._sf(v01),
+    );
+  },
+  svFromHsg(hueDeg, s01, gray) {
+    if (!this.ready) return null;
+    return this._lerp3c2(
+      this.sv,
+      this.H,
+      this.S,
+      this.G,
+      this._hf(hueDeg),
+      this._sf(s01),
+      this._gf(gray),
+    );
+  },
+};
+
+function toggleMode() {
+  cycleState = (cycleState + 1) % 2;
+  if (cycleState === 0) {
+    console.log("🟡 状态 0");
+    debugBtn.classList.remove("active-mode"); 
+  } else {
+    console.log("🔴 状态 1");
+    if (LUT.ready)
+      targetGray = perceptualBrightness(currentHue, currentS, currentV);
+    debugBtn.classList.add("active-mode"); 
+  }
+  redraw(false);
+}
+entrypoints.setup({
+  panels: {
+    "com.yourname.lutpicker.panel": {
+      show() {
+        if (initialized) {
+          resizeCanvases();
+          return;
+        }
+        initialized = true;
+        requestAnimationFrame(() => {
+          delayedInit();
+        });
+      },
+    },
+  },
+  commands: {
+    toggleLUTMode: () => {
+      toggleMode();
+    },
+  },
+});
+
+function delayedInit() {
+  initDOM();
+  bindEvents();
+  requestAnimationFrame(() => {
+    initHeavy();
+  });
+}
+function initDOM() {
+  svArea = document.getElementById("svArea");
+  hueArea = document.getElementById("hueArea");
+  svCanvas = document.getElementById("svCanvas");
+  hueCanvas = document.getElementById("hueCanvas");
+  svCtx = svCanvas.getContext("2d");
+  hueCtx = hueCanvas.getContext("2d");
+  svMarker = document.getElementById("svMarker");
+  hueMarker = document.getElementById("hueMarker");
+  swatch = document.getElementById("swatch");
+  colorText = document.getElementById("colorText");
+  debugBtn = document.getElementById("debugBtn");
+}
+
+function bindEvents() {
+  if (debugBtn) {
+    debugBtn.addEventListener("click", toggleMode);
+  }
+  let draggingSV = false,
+    draggingHue = false;
+  svArea.addEventListener("mousedown", (e) => {
+    draggingSV = true;
+    updateSVFromMouse(e);
+  });
+  svArea.addEventListener("mousemove", (e) => {
+    if (!draggingSV) return;
+    updateSVFromMouse(e);
+  });
+  hueArea.addEventListener("mousedown", (e) => {
+    draggingHue = true;
+    updateHueFromMouse(e);
+  });
+  hueArea.addEventListener("mousemove", (e) => {
+    if (!draggingHue) return;
+    updateHueFromMouse(e);
+  });
+
+  document.body.addEventListener("mouseup", async () => {
+    if (draggingSV || draggingHue) {
+      isUpdatingFromPlugin = true;
+      const rgb = hsvToRgb(currentHue, currentS, currentV);
+      try {
+        await core.executeAsModal(
+          async () => {
+            const newColor = app.foregroundColor;
+            newColor.rgb.red = rgb.r;
+            newColor.rgb.green = rgb.g;
+            newColor.rgb.blue = rgb.b;
+            app.foregroundColor = newColor;
+          },
+          { commandName: "Set Foreground Color" },
+        );
+      } catch (e) {
+        console.error("Set PS foreground color failed:", e);
+      }
+      setTimeout(() => {
+        isUpdatingFromPlugin = false;
+      }, 200);
+    }
+    draggingSV = false;
+    draggingHue = false;
+  });
+
+  if (typeof ResizeObserver !== "undefined") {
+    let resizeTimer = null;
+    const ro = new ResizeObserver(() => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeCanvases();
+      }, 50);
+    });
+    ro.observe(svArea);
+    ro.observe(hueArea);
+  }
+
+  document.body.setAttribute("tabindex", "0");
+
+  document.addEventListener("mousedown", () => {
+    document.body.focus();
+  });
+
+  document.addEventListener("keydown", (e) => {
+
+    console.log(
+      `⌨️ Keydown detected! key: "${e.key}", shift: ${e.shiftKey}, meta: ${e.metaKey}, ctrl: ${e.ctrlKey}, isComposing: ${e.isComposing}`,
+    );
+
+    if (e.isComposing) {
+      return;
+    }
+
+    if (e.key === "`" || e.key === "·" || e.key === "～") {
+      console.log("🔥🔥🔥 Backquote/Chinese variant MATCHED! Toggling mode...");
+      toggleMode();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    if (e.key === "H" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      console.log("🔥🔥🔥 Shift+H MATCHED! Toggling mode...");
+      toggleMode();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+  });
+}
+
+async function initHeavy() {
+  resizeCanvases();
+  await LUT.init();
+  setupColorListener();
+}
+
+function hsvToRgb(h, s, v) {
+  const c = v * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = v - c;
+  let r = 0,
+    g = 0,
+    b = 0;
+  if (h < 60) {
+    r = c;
+    g = x;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+  } else if (h < 180) {
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  return {
+    r: Math.round((r + m) * 255),
+    g: Math.round((g + m) * 255),
+    b: Math.round((b + m) * 255),
+  };
+}
+function rgbToHsv(r, g, b) {
+  ((r /= 255), (g /= 255), (b /= 255));
+  const max = Math.max(r, g, b),
+    min = Math.min(r, g, b);
+  let h = 0,
+    s = 0,
+    v = max;
+  const d = max - min;
+  s = max === 0 ? 0 : d / max;
+  if (max !== min) {
+    switch (max) {
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0);
+        break;
+      case g:
+        h = (b - r) / d + 2;
+        break;
+      case b:
+        h = (r - g) / d + 4;
+        break;
+    }
+    h /= 6;
+  }
+  return { h: h * 360, s, v };
+}
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("");
+}
+function perceptualBrightness(h, s, v) {
+  const lutVal = LUT.grayFromHsv(h, s, v);
+  if (lutVal !== null) return Math.round(lutVal);
+  const { r, g, b } = hsvToRgb(h, s, v);
+  return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+}
+function drawSVBackground() {
+  const w = svCanvas.width;
+  const h = svCanvas.height;
+  if (w <= 0 || h <= 0) return;
+  svCtx.clearRect(0, 0, w, h);
+  const pureRgb = hsvToRgb(currentHue, 1, 1);
+  svCtx.fillStyle = rgbToHex(pureRgb.r, pureRgb.g, pureRgb.b);
+  svCtx.fillRect(0, 0, w, h);
+  const whiteGrad = svCtx.createLinearGradient(0, 0, w, 0);
+  whiteGrad.addColorStop(0, "rgba(255,255,255,1)");
+  whiteGrad.addColorStop(1, "rgba(255,255,255,0)");
+  svCtx.fillStyle = whiteGrad;
+  svCtx.fillRect(0, 0, w, h);
+  const blackGrad = svCtx.createLinearGradient(0, 0, 0, h);
+  blackGrad.addColorStop(0, "rgba(0,0,0,0)");
+  blackGrad.addColorStop(1, "rgba(0,0,0,1)");
+  svCtx.fillStyle = blackGrad;
+  svCtx.fillRect(0, 0, w, h);
+}
+function drawHueBackground() {
+  const w = hueCanvas.width;
+  const h = hueCanvas.height;
+  if (w <= 0 || h <= 0) return;
+  const grad = hueCtx.createLinearGradient(0, h, 0, 0);
+  grad.addColorStop(0, "#ff0000");
+  grad.addColorStop(1 / 6, "#ffff00");
+  grad.addColorStop(2 / 6, "#00ff00");
+  grad.addColorStop(3 / 6, "#00ffff");
+  grad.addColorStop(4 / 6, "#0000ff");
+  grad.addColorStop(5 / 6, "#ff00ff");
+  grad.addColorStop(1, "#ff0000");
+  hueCtx.fillStyle = grad;
+  hueCtx.fillRect(0, 0, w, h);
+}
+function updateMarkers() {
+  const svW = svArea.clientWidth;
+  const svH = svArea.clientHeight;
+  const hueH = hueArea.clientHeight;
+  svMarker.style.transform = `translate(${currentS * svW}px, ${(1 - currentV) * svH}px) translate(-50%, -50%)`;
+  hueMarker.style.transform = `translateY(${(1 - currentHue / 360) * hueH}px) translateY(-50%)`;
+}
+function redraw(needsHueUpdate = true) {
+  if (needsHueUpdate) {
+    drawSVBackground();
+  }
+  updateMarkers();
+  updateColorInfo();
+}
+function updateColorInfo() {
+  const rgb = hsvToRgb(currentHue, currentS, currentV);
+  const hex = rgbToHex(rgb.r, rgb.g, rgb.b);
+  swatch.style.backgroundColor = hex;
+  colorText.textContent =
+    "H:" +
+    Math.round(currentHue) +
+    " S:" +
+    Math.round(currentS * 100) +
+    "%" +
+    " V:" +
+    Math.round(currentV * 100) +
+    "%" +
+    " " +
+    hex;
+}
+function resizeCanvases() {
+  if (!svArea || !hueArea) return;
+  const svRect = svArea.getBoundingClientRect();
+  const hueRect = hueArea.getBoundingClientRect();
+  if (svRect.width > 0 && svRect.height > 0) {
+    svCanvas.width = Math.round(svRect.width);
+    svCanvas.height = Math.round(svRect.height);
+  }
+  if (hueRect.width > 0 && hueRect.height > 0) {
+    hueCanvas.width = Math.round(hueRect.width);
+    hueCanvas.height = Math.round(hueRect.height);
+  }
+  drawHueBackground();
+  redraw(true);
+}
+function scheduleBackgroundRedraw() {
+  if (!isBgRedrawScheduled) {
+    isBgRedrawScheduled = true;
+    requestAnimationFrame(() => {
+      drawSVBackground();
+      isBgRedrawScheduled = false;
+    });
+  }
+}
+function updateSVFromMouse(e) {
+  const rect = svArea.getBoundingClientRect();
+  const s = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  if (cycleState === 1 && LUT.ready) {
+    const [sPrime, vVal] = LUT.svFromHsg(currentHue, s, targetGray);
+    currentS = s;
+    currentV = Math.max(0, Math.min(1, vVal / 255));
+  } else {
+    currentS = s;
+    currentV = Math.max(
+      0,
+      Math.min(1, 1 - (e.clientY - rect.top) / rect.height),
+    );
+  }
+  updateMarkers();
+  updateColorInfo();
+}
+function updateHueFromMouse(e) {
+  const rect = hueArea.getBoundingClientRect();
+  const h = Math.max(
+    0,
+    Math.min(360, (1 - (e.clientY - rect.top) / rect.height) * 360),
+  );
+  if (cycleState === 1 && LUT.ready) {
+    const [sPrime, vVal] = LUT.svFromHsg(h, currentS, targetGray);
+    currentHue = h;
+    currentV = Math.max(0, Math.min(1, vVal / 255));
+  } else {
+    currentHue = h;
+  }
+  updateMarkers();
+  updateColorInfo();
+  scheduleBackgroundRedraw();
+}
+
+const onSetEvent = (event) => {
+
+  if (event.to && event.to.opacity) {
+    const opVal = event.to.opacity._value || event.to.opacity;
+    if (Math.round(opVal) === 1) {
+      console.log("🚀 Opacity 1% signal detected! Toggling mode...");
+      isUpdatingFromPlugin = true;
+      toggleMode();
+
+      setTimeout(async () => {
+        try {
+          await core.executeAsModal(
+            async () => {
+              await action.batchPlay(
+                [
+                  {
+                    _obj: "set",
+                    _target: [
+                      { _ref: "brush", _enum: "ordinal", _value: "targetEnum" },
+                    ],
+                    to: {
+                      _obj: "brush",
+                      opacity: { _unit: "percentUnit", _value: 100 },
+                    },
+                    _options: { dialogOptions: "dontDisplay" },
+                  },
+                ],
+                {},
+              );
+            },
+            { commandName: "Restore Opacity" },
+          );
+        } catch (e) {
+          console.error(e);
+        }
+        isUpdatingFromPlugin = false;
+      }, 50);
+      return; 
+    }
+  }
+
+  if (isUpdatingFromPlugin) return;
+  if (colorCheckTimer) clearTimeout(colorCheckTimer);
+  colorCheckTimer = setTimeout(() => {
+    try {
+      const fgColor = app.foregroundColor;
+      const r = Math.round(fgColor.rgb.red);
+      const g = Math.round(fgColor.rgb.green);
+      const b = Math.round(fgColor.rgb.blue);
+
+      const curRgb = hsvToRgb(currentHue, currentS, currentV);
+      if (
+        Math.abs(curRgb.r - r) > 1 ||
+        Math.abs(curRgb.g - g) > 1 ||
+        Math.abs(curRgb.b - b) > 1
+      ) {
+        const hsv = rgbToHsv(r, g, b);
+        currentHue = hsv.h;
+        currentS = hsv.s;
+        currentV = hsv.v;
+        if (cycleState === 1) {
+          targetGray = perceptualBrightness(currentHue, currentS, currentV);
+        }
+        redraw(true);
+      }
+    } catch (e) {
+      console.error("Error reading foreground color in listener", e);
+    }
+  }, 50);
+};
+
+async function setupColorListener() {
+  try {
+    await action.addNotificationListener([{ event: "set" }], onSetEvent);
+  } catch (e) {
+    console.error("Failed to add listener", e);
+  }
+}
+
+---=== manifest.json ===---
+{
+  "id": "com.yourname.lutpicker",
+  "name": "LUT Color Picker",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": { "app": "PS", "minVersion": "24.0.0" },
+  "requiredPermissions": { "executeAsModal": true },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "com.yourname.lutpicker.panel",
+      "label": "LUT Picker",
+      "minimumSize": { "width": 230, "height": 300 },
+      "maximumSize": { "width": 800, "height": 900 },
+      "preferredDockedSize": { "width": 280, "height": 500 },
+      "preferredFloatingSize": { "width": 280, "height": 500 },
+      "icons": [
+        {
+          "width": 32,
+          "height": 32,
+          "path": "images/icon@1x.png",
+          "scale": [1, 2],
+          "theme": ["dark", "darkest"],
+          "species": ["generic"]
+        },
+        {
+          "width": 32,
+          "height": 32,
+          "path": "images/icon@2x.png",
+          "scale": [1, 2],
+          "theme": ["lightest", "light"],
+          "species": ["generic"]
+        }
+      ]
+    },
+    {
+      "type": "command",
+      "id": "toggleLUTMode",
+      "label": "Toggle LUT Mode"
+    }
+  ],
+  "icons": [
+    {
+      "width": 32,
+      "height": 32,
+      "path": "images/icon@1x.png",
+      "scale": [1, 2],
+      "theme": ["dark", "darkest"],
+      "species": ["generic"]
+    },
+    {
+      "width": 32,
+      "height": 32,
+      "path": "images/icon@2x.png",
+      "scale": [1, 2],
+      "theme": ["lightest", "light"],
+      "species": ["generic"]
+    }
+  ]
+}
+
+---=== style.css ===---
+body {
+  margin: 0;
+  background: #2b2b2b;
+  color: #e0e0e0;
+  font-family:
+    Adobe Clean,
+    sans-serif;
+  font-size: 11px;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.pickerContainer {
+  flex: 1 1 auto;
+  display: flex;
+  padding: 8px;
+  min-height: 0;
+}
+.svArea {
+  flex: 1 1 auto;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+#svCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+.marker-circle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid white;
+  box-shadow: 0 0 0 1.5px black;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  will-change: transform;
+}
+.hueArea {
+  flex: 0 0 18px;
+  position: relative;
+  margin-left: 18px;
+  min-height: 0;
+}
+#hueCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+.marker-hue {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  top: 0;
+  background: white;
+  box-shadow:
+    0 0 0 1px black,
+    0 -1px 0 1px black,
+    0 1px 0 1px black;
+  pointer-events: none;
+  transform: translateY(-50%);
+  will-change: transform;
+}
+.colorInfo {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-top: 1px solid #444;
+  background: #333;
+}
+.swatch {
+  width: 20px;
+  height: 20px;
+  border: 1px solid #888;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.colorText {
+  font-family: "Source Code Pro", Menlo, monospace;
+  font-size: 11px;
+  color: #ccc;
+}
+#debugBtn {
+  margin-left: auto; 
+  padding: 0 16px;
+  height: 30px;           
+  line-height: 40px;
+  cursor: pointer;
+
+  background: #333; 
+  border: 3px solid #aaa; 
+  border-radius: 14px;     
+  color: #ccc;
+  font-size: 11px;
+  transition: all 0.15s ease;
+}
+
+#debugBtn.active-mode {
+  background: #333;
+  border-color: #ccc;                                  
+  color: #fff;                                             
+}
+
+---=== asset/hsg_to_sv_down.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/hsv_to_gray_down.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== images/icon@1x.png ===---
+[binary file omitted -- 357 bytes]
+
+---=== images/icon@2x.png ===---
+[binary file omitted -- 607 bytes]

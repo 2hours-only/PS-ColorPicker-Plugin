@@ -1,0 +1,1746 @@
+Project
+multi panel try
+===== 目录结构 =====
+
+Test-9r5zrp/
+├── asset/
+│   ├── cmyk_boundary.bin
+│   ├── hsg_to_sv_down.bin
+│   ├── hsv_to_gray_down.bin
+│   ├── visual_hsg2sv_dark.bin
+│   ├── visual_hsg2sv_default.bin
+│   ├── visual_hsg2sv_dotgain15.bin
+│   ├── visual_hsg2sv_gamma22.bin
+│   ├── visual_hsg2sv_light.bin
+│   ├── visual_hsv2g_dark.bin
+│   ├── visual_hsv2g_default.bin
+│   ├── visual_hsv2g_dotgain15.bin
+│   ├── visual_hsv2g_gamma22.bin
+│   └── visual_hsv2g_light.bin
+├── images/
+│   ├── icon@1x.png
+│   └── icon@2x.png
+├── old_version/
+├── cmyk_gen.js
+├── index.html
+├── index.js
+├── manifest.json
+├── style.css
+└── t.py
+
+===== 项目代码 =====
+
+---=== cmyk_gen.js ===---
+#target photoshop
+
+(function() {
+    var result = [];
+
+    var THRESHOLD = 15; 
+
+    var color = new SolidColor();
+    var totalIterations = 180 * 256;
+    var currentIteration = 0;
+
+    for (var h_idx = 0; h_idx < 180; h_idx++) {
+        color.hsb.hue = h_idx * 2;
+        var row = []; 
+
+        for (var s_idx = 0; s_idx < 256; s_idx++) {
+            color.hsb.saturation = s_idx * (100 / 255);
+
+            var low = 0.0;
+            var high = 100.0;
+            var mid;
+
+            for (var i = 0; i < 12; i++) { 
+                mid = (low + high) / 2.0;
+                color.hsb.brightness = mid;
+
+                var r1 = color.rgb.red;
+                var g1 = color.rgb.green;
+                var b1 = color.rgb.blue;
+
+                var cmyk = color.cmyk;
+
+                var c2 = new SolidColor();
+                c2.cmyk = cmyk;
+                var r2 = c2.rgb.red;
+                var g2 = c2.rgb.green;
+                var b2 = c2.rgb.blue;
+
+                var diff = Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+
+                if (diff > THRESHOLD) {
+                    high = mid; 
+                } else {
+                    low = mid;  
+                }
+            }
+
+            row.push(Math.round(low * 2.55));
+            currentIteration++;
+        }
+
+        result.push(row);
+        $.writeln("Completed H_idx: " + h_idx + " (" + (currentIteration/totalIterations*100).toFixed(1) + "%)");
+    }
+
+var projectDir = File($.fileName).parent.fsName; 
+var file = new File(projectDir + "/asset/cmyk_boundary.bin");
+
+file.encoding = "BINARY";
+file.open("w");
+for (var h_idx = 0; h_idx < 180; h_idx++) {
+    for (var s_idx = 0; s_idx < 256; s_idx++) {
+        file.write(String.fromCharCode(result[h_idx][s_idx]));
+    }
+}
+file.close();
+alert("✅ 二进制分界线数据已直接覆盖至项目目录：\n" + file.fsName);
+
+})();
+
+---=== index.html ===---
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="pickerContainer">
+      <div class="swatch" id="swatch"></div>
+      <div id="warningIcon" class="warning-icon"></div>
+      <div id="altSwatch" class="alt-swatch"></div>
+      <div class="gray-swatch" id="graySwatch"></div>
+      <div class="svArea" id="svArea">
+        <canvas id="svCanvas"></canvas>
+        <div id="svMarker" class="marker-circle"></div>
+      </div>
+      <div class="hueArea" id="hueArea">
+        <canvas id="hueCanvas"></canvas>
+        <div id="hueMarker" class="marker-hue"></div>
+      </div>
+    </div>
+    <dialog id="settingsDialog" tabindex="-1">
+      <form
+        method="dialog"
+        style="display: flex; flex-direction: column; gap: 16px; width: 100%"
+      >
+        <h2 style="margin: 0; font-size: 18px; color: #fff">Settings</h2>
+        <p
+          style="
+            margin: 0 0 16px 0;
+            font-size: 11px;
+            color: #999;
+            line-height: 1.4;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #444;
+          "
+        >
+          快捷键格式：单键如
+          <code style="background: #555; padding: 1px 4px; border-radius: 3px"
+            >`</code
+          >
+          或
+          <code style="background: #555; padding: 1px 4px; border-radius: 3px"
+            >F1</code
+          >，组合键用 + 连接如
+          <code style="background: #555; padding: 1px 4px; border-radius: 3px"
+            >Shift+H</code
+          >；多组快捷键用英文逗号分隔。
+        </p>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input
+            type="checkbox"
+            id="dlg_enableMode"
+            style="
+              width: 16px;
+              height: 16px;
+              margin: 0;
+              cursor: pointer;
+              accent-color: #0d99ff;
+            "
+          />
+          <label for="dlg_enableMode" style="margin: 0; cursor: pointer"
+            >启用 LUT 模式</label
+          >
+        </div>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input
+            type="checkbox"
+            id="dlg_showGuideLines"
+            style="
+              width: 16px;
+              height: 16px;
+              margin: 0;
+              cursor: pointer;
+              accent-color: #0d99ff;
+            "
+          />
+          <label for="dlg_showGuideLines" style="margin: 0; cursor: pointer"
+            >显示指示线</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>快捷键 1 (切换模式):</label>
+          <input
+            type="text"
+            id="dlg_shortcut1"
+            placeholder="例如: ` , · , ～"
+          />
+        </div>
+        <div class="setting-group">
+          <label>快捷键 2 (切换指示线):</label>
+          <input type="text" id="dlg_shortcut2" placeholder="例如: Shift+H" />
+        </div>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input
+            type="checkbox"
+            id="dlg_useSeparateHV"
+            style="
+              width: 16px;
+              height: 16px;
+              margin: 0;
+              cursor: pointer;
+              accent-color: #0d99ff;
+            "
+          />
+          <label for="dlg_useSeparateHV" style="margin: 0; cursor: pointer"
+            >分别设置 S/V 线数</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>S 方向指示线数 (0 - 15):</label>
+          <input type="number" id="dlg_hLines" min="0" max="15" step="1" />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group" id="vLinesGroup">
+          <label>V 方向指示线数 (0 - 15):</label>
+          <input
+            type="number"
+            id="dlg_vLines"
+            min="0"
+            max="15"
+            step="1"
+            disabled
+          />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group" style="margin-top: 4px">
+          <label>颜色配置:</label>
+          <div class="custom-dropdown" id="dlg_updateColorConfigDropdown">
+            <div class="dropdown-selected">
+              <span class="selected-text">1</span>
+            </div>
+            <div class="dropdown-options">
+              <div class="dropdown-option" data-value="1">默认</div>
+              <div class="dropdown-option" data-value="2">较亮</div>
+              <div class="dropdown-option" data-value="3">较暗</div>
+              <div class="dropdown-divider"></div>
+              <div class="dropdown-option" data-value="4">Dot Gain 15%</div>
+              <div class="dropdown-option" data-value="5">Gray Gamma 2.2</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="dialog-buttons">
+          <button type="button" id="dlg_cancelBtn" uxp-variant="primary">
+            取消
+          </button>
+          <button type="button" id="dlg_saveBtn" uxp-variant="cta">保存</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="index.js"></script>
+  </body>
+</html>
+
+---=== index.js ===---
+const { core, app, action } = require("photoshop");
+const { entrypoints } = require("uxp");
+
+let cachedBlackGrad = null;
+let currentHue = 0;
+let currentS = 1;
+let currentV = 1;
+let cycleState = 0;
+let targetGray = null;
+let isUpdatingFromPlugin = false;
+let colorCheckTimer = null;
+let isBgRedrawScheduled = false;
+let pendingBgUpdate = false;
+let initialized = false;
+let settingsBeforeDialog = null;
+
+let svArea, hueArea, svCanvas, hueCanvas, svCtx, hueCtx;
+let svMarker, hueMarker, swatch, graySwatch;
+let altSwatch;
+let warningIcon;
+
+let svAreaRect = null;
+let hueAreaRect = null;
+let lastColorStr = "";
+let lastAltColorStr = "";
+
+const LUT = {
+  gray: null,
+  sv: null,
+  boundary: null,
+  ready: false,
+  currentPreset: null,
+  H: 45,
+  S: 128,
+  G: 128,
+  HF: 4,
+  SF: 2,
+  async init(presetKey = "1") {
+    if (presetKey === this.currentPreset && this.ready) return;
+    const suffixMap = {
+      1: "default",
+      2: "light",
+      3: "dark",
+      4: "dotgain15",
+      5: "gamma22",
+    };
+    const suffix = suffixMap[presetKey] || "default";
+    try {
+      const grayResp = await fetch(`./asset/visual_hsv2g_${suffix}.bin`);
+      const grayBuf = await grayResp.arrayBuffer();
+      await new Promise((r) => setTimeout(r, 0)); 
+
+      const svResp = await fetch(`./asset/visual_hsg2sv_${suffix}.bin`);
+      const svBuf = await svResp.arrayBuffer();
+
+      if (!this.boundary) {
+        await new Promise((r) => setTimeout(r, 0)); 
+        const boundaryResp = await fetch("./asset/cmyk_boundary.bin");
+        const boundaryBuf = await boundaryResp.arrayBuffer();
+        this.boundary = new Uint8Array(boundaryBuf);
+      }
+
+      this.gray = new Uint8Array(grayBuf);
+      this.sv = new Uint8Array(svBuf);
+      this.currentPreset = presetKey;
+      this.ready = true;
+      redraw(true);
+      console.log(`✅ LUT 预设加载成功: ${suffix}`);
+    } catch (e) {
+      console.warn("❌ LUT load failed:", e);
+      this.ready = false;
+    }
+  },
+
+  _lerp3(arr, d0, d1, d2, f0, f1, f2) {
+    const i0 = f0 | 0,
+      i1 = f1 | 0,
+      i2 = f2 | 0;
+    const j0 = Math.min(i0 + 1, d0 - 1);
+    const j1 = Math.min(i1 + 1, d1 - 1);
+    const j2 = Math.min(i2 + 1, d2 - 1);
+    const a = f0 - i0,
+      b = f1 - i1,
+      c = f2 - i2;
+    const x = 1 - a,
+      y = 1 - b,
+      z = 1 - c;
+    const p = (a0, a1, a2) => a0 * d1 * d2 + a1 * d2 + a2;
+    return (
+      arr[p(i0, i1, i2)] * x * y * z +
+      arr[p(j0, i1, i2)] * a * y * z +
+      arr[p(i0, j1, i2)] * x * b * z +
+      arr[p(j0, j1, i2)] * a * b * z +
+      arr[p(i0, i1, j2)] * x * y * c +
+      arr[p(j0, i1, j2)] * a * y * c +
+      arr[p(i0, j1, j2)] * x * b * c +
+      arr[p(j0, j1, j2)] * a * b * c
+    );
+  },
+  _lerp3c2(arr, d0, d1, d2, f0, f1, f2) {
+    const i0 = f0 | 0,
+      i1 = f1 | 0,
+      i2 = f2 | 0;
+    const j0 = Math.min(i0 + 1, d0 - 1);
+    const j1 = Math.min(i1 + 1, d1 - 1);
+    const j2 = Math.min(i2 + 1, d2 - 1);
+    const a = f0 - i0,
+      b = f1 - i1,
+      c = f2 - i2;
+    const x = 1 - a,
+      y = 1 - b,
+      z = 1 - c;
+    const p = (a0, a1, a2, ch) => (a0 * d1 * d2 + a1 * d2 + a2) * 2 + ch;
+    const res = [0, 0];
+    for (let ch = 0; ch < 2; ch++) {
+      res[ch] = Math.round(
+        arr[p(i0, i1, i2, ch)] * x * y * z +
+          arr[p(j0, i1, i2, ch)] * a * y * z +
+          arr[p(i0, j1, i2, ch)] * x * b * z +
+          arr[p(j0, j1, i2, ch)] * a * b * z +
+          arr[p(i0, i1, j2, ch)] * x * y * c +
+          arr[p(j0, i1, j2, ch)] * a * y * c +
+          arr[p(i0, j1, j2, ch)] * x * b * c +
+          arr[p(j0, j1, j2, ch)] * a * b * c,
+      );
+    }
+    return res;
+  },
+  _hf(hueDeg) {
+    return Math.max(0, Math.min(this.H - 1, hueDeg / (2 * this.HF)));
+  },
+  _sf(v01) {
+    return Math.max(0, Math.min(this.S - 1, (v01 * 255) / this.SF));
+  },
+  _gf(gray) {
+    return Math.max(0, Math.min(this.G - 1, gray / this.SF));
+  },
+  grayFromHsv(hueDeg, s01, v01) {
+    if (!this.ready) return null;
+    return this._lerp3(
+      this.gray,
+      this.H,
+      this.S,
+      this.S,
+      this._hf(hueDeg),
+      this._sf(s01),
+      this._sf(v01),
+    );
+  },
+  svFromHsg(hueDeg, s01, gray) {
+    if (!this.ready) return null;
+    return this._lerp3c2(
+      this.sv,
+      this.H,
+      this.S,
+      this.G,
+      this._hf(hueDeg),
+      this._sf(s01),
+      this._gf(gray),
+    );
+  },
+  boundaryFromHs(hueDeg, s01) {
+    if (!this.boundary) return 1.0;
+
+    const h_idx = Math.round(hueDeg / 2) % 180;
+    const s_idx = Math.min(255, Math.max(0, Math.round(s01 * 255)));
+    const offset = h_idx * 256 + s_idx;
+    return this.boundary[offset] / 255.0;
+  },
+};
+
+function setMode(enabled) {
+  const newState = enabled ? 1 : 0;
+  if (cycleState !== newState) {
+    cycleState = newState;
+    if (cycleState === 0) {
+      console.log("🟡 状态 0 (Mode Disabled)");
+    } else {
+      console.log("🔴 状态 1 (Mode Enabled)");
+      if (LUT.ready)
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+    }
+    scheduleVisualUpdate(false);
+  }
+}
+
+function updateGuideLinesBtnState() {}
+
+entrypoints.setup({
+  panels: {
+    "com.yourname.lutpicker.panel": {
+      show() {
+        if (initialized) {
+          resizeCanvases();
+          return;
+        }
+        initialized = true;
+        requestAnimationFrame(() => {
+          delayedInit();
+        });
+      },
+    },
+  },
+  commands: {
+    toggleLUTMode: () => {
+      activeSettings.enableMode = !activeSettings.enableMode;
+      saveSettings(activeSettings);
+      setMode(activeSettings.enableMode);
+    },
+  },
+});
+
+function delayedInit() {
+  initDOM();
+  activeSettings = loadSettings();
+  setMode(activeSettings.enableMode);
+  updateGuideLinesBtnState();
+  bindEvents();
+  requestAnimationFrame(() => {
+    initHeavy();
+  });
+}
+
+let activeSettings = null;
+
+function matchShortcut(event, shortcutStr) {
+  if (!shortcutStr) return false;
+  const shortcuts = shortcutStr
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return shortcuts.some((shortcut) => {
+    const parts = shortcut.split("+").map((p) => p.trim());
+    const key = parts.pop();
+    const requiresShift = parts.includes("shift");
+    const requiresCtrl = parts.includes("ctrl");
+    const requiresMeta = parts.includes("meta") || parts.includes("cmd");
+    const shiftMatch = requiresShift ? event.shiftKey : !event.shiftKey;
+    const ctrlMatch = requiresCtrl ? event.ctrlKey : !event.ctrlKey;
+    const metaMatch = requiresMeta ? event.metaKey : !event.metaKey;
+    const keyMatch = event.key.toLowerCase() === key;
+    return shiftMatch && ctrlMatch && metaMatch && keyMatch;
+  });
+}
+
+let settingsDialog,
+  dlgShortcut1,
+  dlgShortcut2,
+  dlgEnableMode,
+  dlgShowGuideLines,
+  dlgUseSeparateHV,
+  dlgHLines,
+  dlgVLines,
+  dlgUpdateColorConfig;
+
+const DEFAULT_SETTINGS = {
+  shortcut1: "` , · , ～",
+  shortcut2: "Shift+H",
+  hLines: 1,
+  vLines: 1,
+  useSeparateHV: false,
+  enableMode: false,
+  showGuideLines: false,
+  colorConfig: "1",
+};
+
+function loadSettings() {
+  try {
+    const saved = localStorage.getItem("lut_picker_settings");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed.enableMode === undefined) parsed.enableMode = false;
+      if (parsed.showGuideLines === undefined) parsed.showGuideLines = false;
+      if (parsed.useSeparateHV === undefined) parsed.useSeparateHV = false;
+      if (parsed.hLines === undefined)
+        parsed.hLines = parsed.intParam !== undefined ? parsed.intParam : 1;
+      if (parsed.vLines === undefined)
+        parsed.vLines = parsed.intParam !== undefined ? parsed.intParam : 1;
+      if (parsed.colorConfig === undefined) parsed.colorConfig = "1"; 
+      return parsed;
+    }
+  } catch (e) {}
+  return { ...DEFAULT_SETTINGS };
+}
+
+function saveSettings(settings) {
+  try {
+    localStorage.setItem("lut_picker_settings", JSON.stringify(settings));
+  } catch (e) {}
+}
+
+function initDOM() {
+  svArea = document.getElementById("svArea");
+  hueArea = document.getElementById("hueArea");
+  svCanvas = document.getElementById("svCanvas");
+  hueCanvas = document.getElementById("hueCanvas");
+  svCtx = svCanvas.getContext("2d");
+  hueCtx = hueCanvas.getContext("2d");
+  svMarker = document.getElementById("svMarker");
+  hueMarker = document.getElementById("hueMarker");
+  swatch = document.getElementById("swatch");
+  graySwatch = document.getElementById("graySwatch");
+  altSwatch = document.getElementById("altSwatch");
+  settingsDialog = document.getElementById("settingsDialog");
+  dlgShortcut1 = document.getElementById("dlg_shortcut1");
+  dlgShortcut2 = document.getElementById("dlg_shortcut2");
+  dlgEnableMode = document.getElementById("dlg_enableMode");
+  dlgShowGuideLines = document.getElementById("dlg_showGuideLines");
+  dlgUseSeparateHV = document.getElementById("dlg_useSeparateHV");
+  dlgHLines = document.getElementById("dlg_hLines");
+  dlgVLines = document.getElementById("dlg_vLines");
+  dlgUpdateColorConfig = document.getElementById(
+    "dlg_updateColorConfigDropdown",
+  );
+  if (dlgUpdateColorConfig) {
+    const selectedDisplay =
+      dlgUpdateColorConfig.querySelector(".dropdown-selected");
+    if (selectedDisplay) {
+
+      selectedDisplay.insertAdjacentHTML(
+        "beforeend",
+        `
+        <svg width="12" height="6" viewBox="0 0 12 6" style="display:block; flex-shrink:0;">
+          <polyline points="2,5 6,1 10,5" fill="none" stroke="#aaa" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      `,
+      );
+    }
+  }
+
+  if (hueMarker) {
+    hueMarker.innerHTML = `
+      <svg width="10" height="12" viewBox="0 0 10 12" style="display:block;">
+        <polygon points="1.0,3.5 3.0,1.5 9.0,6 3.0,10.5 1.0,8.5" fill=#ddd stroke="black" stroke-width="1" stroke-linejoin="round" />
+      </svg>
+    `;
+  }
+  warningIcon = document.getElementById("warningIcon");
+  if (warningIcon) {
+    warningIcon.innerHTML = `
+      <svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block;">
+        <polygon points="12,2 1,22 23,22" fill="#ddd" stroke="#ddd" stroke-width="1.5" stroke-linejoin="round" />
+        <rect x="10.7" y="7" width="2.5" height="8" rx="1" fill="#333" />
+        <circle cx="12" cy="18.5" r="1.5" fill="#333" />
+      </svg>
+    `;
+  }
+}
+
+function bindEvents() {
+  if (graySwatch) {
+    graySwatch.addEventListener("click", () => {
+      const currentSettings = loadSettings();
+      settingsBeforeDialog = JSON.parse(JSON.stringify(currentSettings)); 
+      syncDialogUI(currentSettings);
+      settingsDialog.showModal();
+    });
+  }
+
+  if (altSwatch) {
+    altSwatch.addEventListener("click", async () => {
+      if (!isTooVivid(currentHue, currentS, currentV)) return;
+      const altHsv = getAltColor(currentHue, currentS, currentV);
+      currentHue = altHsv.h;
+      currentS = altHsv.s;
+      currentV = altHsv.v;
+      if (cycleState === 1) {
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+      }
+      scheduleVisualUpdate(false);
+      const altRgb = hsvToRgb(altHsv.h, altHsv.s, altHsv.v);
+      isUpdatingFromPlugin = true;
+      try {
+        await core.executeAsModal(
+          async () => {
+            const newColor = app.foregroundColor;
+            newColor.rgb.red = altRgb.r;
+            newColor.rgb.green = altRgb.g;
+            newColor.rgb.blue = altRgb.b;
+            app.foregroundColor = newColor;
+          },
+          { commandName: "Set Alt Foreground Color" },
+        );
+      } catch (e) {
+        console.error("Set Alt Foreground Color failed:", e);
+      }
+      setTimeout(() => {
+        isUpdatingFromPlugin = false;
+      }, 200);
+    });
+  }
+
+  const dlgCancelBtn = document.getElementById("dlg_cancelBtn");
+  const dlgSaveBtn = document.getElementById("dlg_saveBtn");
+
+  if (dlgUseSeparateHV) {
+    dlgUseSeparateHV.addEventListener("change", () => {
+      const isSeparate = dlgUseSeparateHV.checked;
+      dlgVLines.disabled = !isSeparate;
+      dlgVLines.style.backgroundColor = isSeparate ? "#444444" : "#4d4d4d";
+    });
+  }
+  if (dlgEnableMode) {
+    dlgEnableMode.addEventListener("change", () => {
+      setMode(dlgEnableMode.checked);
+    });
+  }
+  if (dlgShowGuideLines) {
+    dlgShowGuideLines.addEventListener("change", () => {
+      activeSettings.showGuideLines = dlgShowGuideLines.checked;
+      scheduleVisualUpdate(true);
+    });
+  }
+  if (dlgUpdateColorConfig) {
+    const selectedDisplay =
+      dlgUpdateColorConfig.querySelector(".dropdown-selected");
+    const selectedText = dlgUpdateColorConfig.querySelector(".selected-text");
+    const optionsContainer =
+      dlgUpdateColorConfig.querySelector(".dropdown-options");
+
+    const handleOverlapInputs = (isOpen) => {
+      const parentGroup = dlgUpdateColorConfig.closest(".setting-group");
+      if (!parentGroup) return;
+
+      const prev1 = parentGroup.previousElementSibling; 
+      const prev2 = prev1 ? prev1.previousElementSibling : null; 
+
+      if (isOpen) {
+        parentGroup.classList.add("dropdown-open");
+        console.log("🔥 下拉菜单展开，隐藏紧邻的S/V线数输入框");
+        if (prev1) prev1.classList.add("hide-native-inputs");
+        if (prev2) prev2.classList.add("hide-native-inputs");
+      } else {
+        parentGroup.classList.remove("dropdown-open");
+        console.log("🔥 下拉菜单关闭，恢复S/V线数输入框");
+        if (prev1) prev1.classList.remove("hide-native-inputs");
+        if (prev2) prev2.classList.remove("hide-native-inputs");
+      }
+    };
+
+    selectedDisplay.addEventListener("click", () => {
+      dlgUpdateColorConfig.classList.toggle("open");
+      handleOverlapInputs(dlgUpdateColorConfig.classList.contains("open"));
+    });
+
+    optionsContainer.addEventListener("click", (e) => {
+      const target = e.target.closest(".dropdown-option");
+      if (target) {
+        const value = target.getAttribute("data-value");
+        selectedText.textContent = target.textContent; 
+        dlgUpdateColorConfig.setAttribute("data-value", value); 
+        dlgUpdateColorConfig.classList.remove("open");
+        handleOverlapInputs(false);
+        console.log(`🔔 选择颜色配置: ${value}`);
+      }
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!dlgUpdateColorConfig.contains(e.target)) {
+        if (dlgUpdateColorConfig.classList.contains("open")) {
+          dlgUpdateColorConfig.classList.remove("open");
+          handleOverlapInputs(false);
+        }
+      }
+    });
+  }
+
+  if (settingsDialog) {
+    settingsDialog.addEventListener("cancel", () => {
+      revertSettings();
+    });
+    settingsDialog.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        const activeEl = document.activeElement;
+        if (activeEl && activeEl.tagName === "INPUT") {
+          activeEl.blur();
+          settingsDialog.focus();
+        } else {
+          if (dlgSaveBtn) dlgSaveBtn.click();
+        }
+      }
+    });
+  }
+  function revertSettings() {
+    if (settingsBeforeDialog) {
+      console.log("↩️ 还原设置到打开前的状态");
+      activeSettings = JSON.parse(JSON.stringify(settingsBeforeDialog));
+      saveSettings(activeSettings);
+      setMode(activeSettings.enableMode);
+      scheduleVisualUpdate(true);
+      syncDialogUI(activeSettings);
+      settingsBeforeDialog = null;
+    }
+  }
+
+  if (dlgCancelBtn) {
+    dlgCancelBtn.addEventListener("click", () => {
+      revertSettings();
+      settingsDialog.close("cancel");
+    });
+  }
+
+  if (dlgSaveBtn) {
+    dlgSaveBtn.addEventListener("click", async () => {
+
+      let hVal = parseInt(dlgHLines.value, 10);
+      if (isNaN(hVal) || hVal < 0) hVal = 0;
+      if (hVal > 15) hVal = 15;
+      let vVal = parseInt(dlgVLines.value, 10);
+      if (isNaN(vVal) || vVal < 0) vVal = 0;
+      if (vVal > 15) vVal = 15;
+      const configVal = dlgUpdateColorConfig
+        ? dlgUpdateColorConfig.getAttribute("data-value")
+        : "1";
+      const newSettings = {
+        shortcut1: dlgShortcut1.value,
+        shortcut2: dlgShortcut2.value,
+        hLines: hVal,
+        vLines: vVal,
+        useSeparateHV: dlgUseSeparateHV.checked,
+        enableMode: dlgEnableMode.checked,
+        showGuideLines: dlgShowGuideLines.checked,
+        colorConfig: configVal,
+      };
+      console.log("✅ 保存设置:", newSettings);
+      saveSettings(newSettings);
+      activeSettings = newSettings;
+      setMode(activeSettings.enableMode);
+      updateGuideLinesBtnState();
+
+      await LUT.init(configVal);
+
+      scheduleVisualUpdate(true);
+      settingsBeforeDialog = null;
+      settingsDialog.close("save");
+    });
+  }
+
+  let draggingSV = false,
+    draggingHue = false;
+
+  svArea.addEventListener("mousedown", (e) => {
+    draggingSV = true;
+    svAreaRect = svArea.getBoundingClientRect();
+    updateSVFromMouse(e);
+    e.preventDefault();
+  });
+
+  hueArea.addEventListener("mousedown", (e) => {
+    draggingHue = true;
+    hueAreaRect = hueArea.getBoundingClientRect();
+    updateHueFromMouse(e);
+    e.preventDefault();
+  });
+
+  document.addEventListener("mousemove", (e) => {
+    if (draggingSV) {
+      updateSVFromMouse(e);
+    } else if (draggingHue) {
+      updateHueFromMouse(e);
+    }
+  });
+
+  document.addEventListener("mouseup", async () => {
+    if (draggingSV || draggingHue) {
+      isUpdatingFromPlugin = true;
+      const rgb = hsvToRgb(currentHue, currentS, currentV);
+      try {
+        await core.executeAsModal(
+          async () => {
+            const newColor = app.foregroundColor;
+            newColor.rgb.red = rgb.r;
+            newColor.rgb.green = rgb.g;
+            newColor.rgb.blue = rgb.b;
+            app.foregroundColor = newColor;
+          },
+          { commandName: "Set Foreground Color" },
+        );
+      } catch (e) {
+        console.error("Set PS foreground color failed:", e);
+      }
+      setTimeout(() => {
+        isUpdatingFromPlugin = false;
+      }, 200);
+    }
+    draggingSV = false;
+    draggingHue = false;
+    svAreaRect = null;
+    hueAreaRect = null;
+  });
+
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => {
+      resizeCanvases();
+    });
+    ro.observe(svArea);
+    ro.observe(hueArea);
+  }
+
+  document.body.setAttribute("tabindex", "0");
+  document.addEventListener("mousedown", () => {
+    document.body.focus();
+  });
+
+  const LONG_PRESS_THRESHOLD = 300;
+
+  let isS1Down = false;
+  let s1DownTime = 0;
+  let modeBeforeS1 = false;
+  let s1UpTimer = null;
+
+  let isS2Down = false;
+  let s2DownTime = 0;
+  let guideLinesBeforeS2 = false;
+  let s2UpTimer = null;
+
+  document.addEventListener("keydown", (e) => {
+    if (e.isComposing) return;
+
+    if (matchShortcut(e, activeSettings.shortcut1)) {
+      if (e.repeat) return;
+
+      if (s1UpTimer) {
+        clearTimeout(s1UpTimer);
+        s1UpTimer = null;
+        isS1Down = true;
+        return;
+      }
+
+      if (!isS1Down) {
+        isS1Down = true;
+        s1DownTime = Date.now();
+        modeBeforeS1 = activeSettings.enableMode;
+
+        activeSettings.enableMode = !activeSettings.enableMode;
+        saveSettings(activeSettings);
+        setMode(activeSettings.enableMode);
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    if (matchShortcut(e, activeSettings.shortcut2)) {
+      if (e.repeat) return;
+
+      if (s2UpTimer) {
+        clearTimeout(s2UpTimer);
+        s2UpTimer = null;
+        isS2Down = true;
+        return;
+      }
+
+      if (!isS2Down) {
+        isS2Down = true;
+        s2DownTime = Date.now();
+        guideLinesBeforeS2 = activeSettings.showGuideLines;
+
+        activeSettings.showGuideLines = !activeSettings.showGuideLines;
+        saveSettings(activeSettings);
+        updateGuideLinesBtnState();
+        scheduleVisualUpdate(true);
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+  });
+
+  document.addEventListener("keyup", (e) => {
+    if (e.isComposing) return;
+
+    if (matchShortcut(e, activeSettings.shortcut1)) {
+      if (!isS1Down) return;
+
+      isS1Down = false;
+      const duration = Date.now() - s1DownTime;
+
+      s1UpTimer = setTimeout(() => {
+        s1UpTimer = null;
+        if (duration >= LONG_PRESS_THRESHOLD) {
+          activeSettings.enableMode = modeBeforeS1;
+          saveSettings(activeSettings);
+          setMode(activeSettings.enableMode);
+        }
+      }, 50);
+
+      e.preventDefault();
+      e.stopPropagation();
+    }
+
+    if (matchShortcut(e, activeSettings.shortcut2)) {
+      if (!isS2Down) return;
+
+      isS2Down = false;
+      const duration = Date.now() - s2DownTime;
+
+      s2UpTimer = setTimeout(() => {
+        s2UpTimer = null;
+        if (duration >= LONG_PRESS_THRESHOLD) {
+          activeSettings.showGuideLines = guideLinesBeforeS2;
+          saveSettings(activeSettings);
+          updateGuideLinesBtnState();
+          scheduleVisualUpdate(true);
+        }
+      }, 50);
+
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
+}
+
+async function initHeavy() {
+  resizeCanvases();
+  const initialPreset = activeSettings ? activeSettings.colorConfig : "1";
+  await LUT.init(initialPreset);
+  setupColorListener();
+}
+
+function hsvToRgb(h, s, v) {
+  const c = v * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = v - c;
+  let r = 0,
+    g = 0,
+    b = 0;
+  if (h < 60) {
+    r = c;
+    g = x;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+  } else if (h < 180) {
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  return {
+    r: Math.round((r + m) * 255),
+    g: Math.round((g + m) * 255),
+    b: Math.round((b + m) * 255),
+  };
+}
+
+function rgbToHsv(r, g, b) {
+  ((r /= 255), (g /= 255), (b /= 255));
+  const max = Math.max(r, g, b),
+    min = Math.min(r, g, b);
+  let h = 0,
+    s = 0,
+    v = max;
+  const d = max - min;
+  s = max === 0 ? 0 : d / max;
+  if (max !== min) {
+    switch (max) {
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0);
+        break;
+      case g:
+        h = (b - r) / d + 2;
+        break;
+      case b:
+        h = (r - g) / d + 4;
+        break;
+    }
+    h /= 6;
+  }
+  return { h: h * 360, s, v };
+}
+
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("");
+}
+
+function perceptualBrightness(h, s, v) {
+  const lutVal = LUT.grayFromHsv(h, s, v);
+  if (lutVal !== null) return Math.round(lutVal);
+  const { r, g, b } = hsvToRgb(h, s, v);
+  return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+}
+
+function drawSVBackground() {
+  const w = svCanvas.width;
+  const h = svCanvas.height;
+  if (w <= 0 || h <= 0) return;
+
+  const pureRgb = hsvToRgb(currentHue, 1, 1);
+  const pureColorStr = `rgb(${pureRgb.r},${pureRgb.g},${pureRgb.b})`;
+
+  const hueGrad = svCtx.createLinearGradient(0, 0, w, 0);
+  hueGrad.addColorStop(0, `rgb(255,255,255)`);
+  hueGrad.addColorStop(1, pureColorStr);
+  svCtx.fillStyle = hueGrad;
+  svCtx.fillRect(0, 0, w, h);
+
+  if (cachedBlackGrad) {
+    svCtx.fillStyle = cachedBlackGrad;
+    svCtx.fillRect(0, 0, w, h);
+  }
+
+  const settings = activeSettings;
+  if (settings && settings.showGuideLines) {
+    const nH = settings.hLines || 0;
+    const nV = settings.useSeparateHV ? settings.vLines || 0 : nH;
+    svCtx.strokeStyle = "#000";
+    svCtx.lineWidth = 1;
+    svCtx.beginPath();
+    if (nH > 0) {
+      const stepH = nH + 1;
+      for (let i = 1; i <= nH; i++) {
+        const ratio = i / stepH;
+        const x = (ratio * w + 0.5) | 0;
+        svCtx.moveTo(x, 0);
+        svCtx.lineTo(x, h);
+      }
+    }
+    if (nV > 0) {
+      const stepV = nV + 1;
+      for (let i = 1; i <= nV; i++) {
+        const ratio = i / stepV;
+        const y = ((1 - ratio) * h + 0.5) | 0;
+        svCtx.moveTo(0, y);
+        svCtx.lineTo(w, y);
+      }
+    }
+    svCtx.stroke();
+  }
+}
+
+function scheduleVisualUpdate(needsBgUpdate = false) {
+  if (needsBgUpdate) {
+    pendingBgUpdate = true;
+  }
+  if (!isBgRedrawScheduled) {
+    isBgRedrawScheduled = true;
+    requestAnimationFrame(() => {
+      if (pendingBgUpdate) {
+        drawSVBackground();
+        pendingBgUpdate = false;
+      }
+      updateMarkers();
+      updateColorInfo();
+      isBgRedrawScheduled = false;
+    });
+  }
+}
+
+function drawHueBackground() {
+  const w = hueCanvas.width;
+  const h = hueCanvas.height;
+  if (w <= 0 || h <= 0) return;
+  const grad = hueCtx.createLinearGradient(0, h, 0, 0);
+  grad.addColorStop(0, "#ff0000");
+  grad.addColorStop(1 / 6, "#ffff00");
+  grad.addColorStop(2 / 6, "#00ff00");
+  grad.addColorStop(3 / 6, "#00ffff");
+  grad.addColorStop(4 / 6, "#0000ff");
+  grad.addColorStop(5 / 6, "#ff00ff");
+  grad.addColorStop(1, "#ff0000");
+  hueCtx.fillStyle = grad;
+  hueCtx.fillRect(0, 0, w, h);
+}
+
+function updateMarkers() {
+  const svW = svArea.clientWidth;
+  const svH = svArea.clientHeight;
+  const hueH = hueArea.clientHeight;
+  svMarker.style.transform = `translate(${currentS * svW}px, ${(1 - currentV) * svH}px) translate(-50%, -50%)`;
+  hueMarker.style.transform = `translateY(${(1 - currentHue / 360) * hueH}px) translateY(-50%)`;
+}
+
+function redraw(needsHueUpdate = true) {
+  if (needsHueUpdate) {
+    drawSVBackground();
+  }
+  updateMarkers();
+  updateColorInfo();
+}
+
+function updateColorInfo() {
+  const rgb = hsvToRgb(currentHue, currentS, currentV);
+  const colorStr = `rgb(${rgb.r},${rgb.g},${rgb.b})`;
+
+  if (colorStr !== lastColorStr) {
+    swatch.style.backgroundColor = colorStr;
+    lastColorStr = colorStr;
+  }
+
+  const tooVivid = isTooVivid(currentHue, currentS, currentV);
+  if (warningIcon) {
+    warningIcon.style.opacity = tooVivid ? "1" : "0";
+    warningIcon.style.pointerEvents = tooVivid ? "auto" : "none";
+  }
+  if (altSwatch) {
+    altSwatch.style.opacity = tooVivid ? "1" : "0";
+    altSwatch.style.pointerEvents = tooVivid ? "auto" : "none";
+    if (tooVivid) {
+      const altHsv = getAltColor(currentHue, currentS, currentV);
+      const altRgb = hsvToRgb(altHsv.h, altHsv.s, altHsv.v);
+      const altColorStr = `rgb(${altRgb.r},${altRgb.g},${altRgb.b})`;
+      if (altColorStr !== lastAltColorStr) {
+        altSwatch.style.backgroundColor = altColorStr;
+        lastAltColorStr = altColorStr;
+      }
+    }
+  }
+}
+
+function resizeCanvases() {
+  if (!svArea || !hueArea) return;
+  const svRect = svArea.getBoundingClientRect();
+  const hueRect = hueArea.getBoundingClientRect();
+
+  let svChanged = false;
+  let hueChanged = false;
+
+  if (svRect.width > 0 && svRect.height > 0) {
+    const newW = Math.round(svRect.width);
+    const newH = Math.round(svRect.height);
+    if (svCanvas.width !== newW || svCanvas.height !== newH) {
+      svCanvas.width = newW;
+      svCanvas.height = newH;
+
+      cachedBlackGrad = svCtx.createLinearGradient(0, 0, 0, newH);
+      cachedBlackGrad.addColorStop(0, "rgba(0,0,0,0)");
+      cachedBlackGrad.addColorStop(1, "rgba(0,0,0,1)");
+      svChanged = true;
+    }
+  }
+
+  if (hueRect.width > 0 && hueRect.height > 0) {
+    const newW = Math.round(hueRect.width);
+    const newH = Math.round(hueRect.height);
+    if (hueCanvas.width !== newW || hueCanvas.height !== newH) {
+      hueCanvas.width = newW;
+      hueCanvas.height = newH;
+      hueChanged = true;
+    }
+  }
+
+  if (hueChanged) drawHueBackground();
+  if (svChanged) drawSVBackground();
+
+  updateMarkers();
+}
+
+function updateSVFromMouse(e) {
+  if (!svAreaRect) return;
+  const s = Math.max(
+    0,
+    Math.min(1, (e.clientX - svAreaRect.left) / svAreaRect.width),
+  );
+  if (cycleState === 1 && LUT.ready) {
+    const [_, vVal] = LUT.svFromHsg(currentHue, s, targetGray);
+    currentS = s;
+    currentV = Math.max(0, Math.min(1, vVal / 255));
+  } else {
+    currentS = s;
+    currentV = Math.max(
+      0,
+      Math.min(1, 1 - (e.clientY - svAreaRect.top) / svAreaRect.height),
+    );
+  }
+  scheduleVisualUpdate(false);
+}
+
+function updateHueFromMouse(e) {
+  if (!hueAreaRect) return;
+  const h = Math.max(
+    0,
+    Math.min(
+      360,
+      (1 - (e.clientY - hueAreaRect.top) / hueAreaRect.height) * 360,
+    ),
+  );
+  if (cycleState === 1 && LUT.ready) {
+    const [_, vVal] = LUT.svFromHsg(h, currentS, targetGray);
+    currentHue = h;
+    currentV = Math.max(0, Math.min(1, vVal / 255));
+  } else {
+    currentHue = h;
+  }
+  scheduleVisualUpdate(true);
+}
+
+const onSetEvent = (event) => {
+  if (isUpdatingFromPlugin) return;
+  if (colorCheckTimer) clearTimeout(colorCheckTimer);
+  colorCheckTimer = setTimeout(() => {
+    try {
+      const fgColor = app.foregroundColor;
+      const r = Math.round(fgColor.rgb.red);
+      const g = Math.round(fgColor.rgb.green);
+      const b = Math.round(fgColor.rgb.blue);
+      const curRgb = hsvToRgb(currentHue, currentS, currentV);
+      if (
+        Math.abs(curRgb.r - r) > 1 ||
+        Math.abs(curRgb.g - g) > 1 ||
+        Math.abs(curRgb.b - b) > 1
+      ) {
+        const hsv = rgbToHsv(r, g, b);
+        currentHue = hsv.h;
+        currentS = hsv.s;
+        currentV = hsv.v;
+        if (cycleState === 1) {
+          targetGray = perceptualBrightness(currentHue, currentS, currentV);
+        }
+        scheduleVisualUpdate(true);
+      }
+    } catch (e) {
+      console.error("Error reading foreground color in listener", e);
+    }
+  }, 50);
+};
+
+async function setupColorListener() {
+  try {
+    await action.addNotificationListener([{ event: "set" }], onSetEvent);
+  } catch (e) {
+    console.error("Failed to add listener", e);
+  }
+}
+
+function getAltColor(h, s, v) {
+  if (!LUT.boundary) {
+    console.warn("⚠️ getAltColor fallback: LUT.boundary is null");
+    return { h: h, s: s * 0.5, v: v * 0.5 };
+  }
+
+  const C = s - v;
+  let bestS = 0;
+  let bestDiff = Infinity;
+
+  const maxSIdx = Math.round(s * 255);
+  for (let s_idx = 0; s_idx <= maxSIdx; s_idx++) {
+    const testS = s_idx / 255.0;
+    const testV = LUT.boundaryFromHs(h, testS);
+    const diff = Math.abs(testS - testV - C);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestS = testS;
+    }
+  }
+
+  const v_alt = LUT.boundaryFromHs(h, bestS);
+
+  console.log(
+    `🎨 getAltColor (45度线投影): Origin S=${s.toFixed(3)}, V=${v.toFixed(3)} | C=${C.toFixed(3)}`,
+  );
+  console.log(
+    `   -> Intersection S=${bestS.toFixed(3)}, V=${v_alt.toFixed(3)} | S-V=${(bestS - v_alt).toFixed(3)}`,
+  );
+
+  return { h: h, s: bestS, v: v_alt };
+}
+
+function isTooVivid(h, s, v) {
+  if (!LUT.boundary) {
+    console.warn("⚠️ isTooVivid fallback: LUT.boundary is null");
+    return s + v > 1.5;
+  }
+  const maxSafeV = LUT.boundaryFromHs(h, s);
+  const result = v > maxSafeV;
+
+  if (v > maxSafeV - 0.1) {
+    console.log(
+      `🔍 isTooVivid: H=${h.toFixed(1)}, S=${s.toFixed(3)}, V=${v.toFixed(3)} | maxSafeV=${maxSafeV.toFixed(3)} | tooVivid=${result}`,
+    );
+  }
+  return result;
+}
+
+function syncDialogUI(settings) {
+  dlgShortcut1.value = settings.shortcut1;
+  dlgShortcut2.value = settings.shortcut2;
+  dlgHLines.value = settings.hLines;
+  dlgVLines.value = settings.vLines;
+  dlgEnableMode.checked = settings.enableMode;
+  dlgShowGuideLines.checked = settings.showGuideLines;
+  const isSeparate = settings.useSeparateHV;
+  dlgUseSeparateHV.checked = isSeparate;
+  dlgVLines.disabled = !isSeparate;
+  dlgVLines.style.backgroundColor = isSeparate ? "#444444" : "#4d4d4d";
+
+  const configValue = settings.colorConfig || "1";
+  const selectedText = dlgUpdateColorConfig.querySelector(".selected-text");
+  const matchedOption = dlgUpdateColorConfig.querySelector(
+    `.dropdown-option[data-value="${configValue}"]`,
+  );
+  if (selectedText)
+    selectedText.textContent = matchedOption
+      ? matchedOption.textContent
+      : "默认";
+  if (dlgUpdateColorConfig)
+    dlgUpdateColorConfig.setAttribute("data-value", configValue);
+}
+
+---=== manifest.json ===---
+{
+  "id": "com.yourname.lutpicker",
+  "name": "LUT Color Picker",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "PS",
+    "minVersion": "24.0.0"
+  },
+  "requiredPermissions": {
+    "executeAsModal": true
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "com.yourname.lutpicker.panel",
+      "label": "颜色",
+      "minimumSize": { "width": 200, "height": 130 },
+      "maximumSize": { "width": 800, "height": 900 },
+      "preferredDockedSize": { "width": 370, "height": 300 },
+      "preferredFloatingSize": { "width": 370, "height": 300 },
+      "icons": [
+        {
+          "width": 32,
+          "height": 32,
+          "path": "images/icon@1x.png",
+          "scale": [1, 2],
+          "theme": ["dark", "darkest"],
+          "species": ["generic"]
+        },
+        {
+          "width": 32,
+          "height": 32,
+          "path": "images/icon@2x.png",
+          "scale": [1, 2],
+          "theme": ["lightest", "light"],
+          "species": ["generic"]
+        }
+      ]
+    },
+    {
+      "type": "command",
+      "id": "toggleLUTMode",
+      "label": "Toggle LUT Mode"
+    }
+  ],
+  "icons": [
+    {
+      "width": 32,
+      "height": 32,
+      "path": "images/icon@1x.png",
+      "scale": [1, 2],
+      "theme": ["dark", "darkest"],
+      "species": ["generic"]
+    },
+    {
+      "width": 32,
+      "height": 32,
+      "path": "images/icon@2x.png",
+      "scale": [1, 2],
+      "theme": ["lightest", "light"],
+      "species": ["generic"]
+    }
+  ]
+}
+
+---=== style.css ===---
+body {
+  margin: 0;
+  background: #535353;
+  color: #e0e0e0;
+  font-family:
+    Adobe Clean,
+    sans-serif;
+  font-size: 11px;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.pickerContainer {
+  flex: 1 1 auto;
+  display: flex;
+  position: relative;
+  padding: 8px 15px 18px 45px;
+  min-height: 0;
+}
+.svArea {
+  flex: 1 1 auto;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+#svCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+.marker-circle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid white;
+  box-shadow: 0 0 0 1.5px black;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  will-change: transform;
+}
+
+.swatch {
+  position: absolute;
+  top: 12px;
+  left: 8px;
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgb(255, 255, 255);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.7),
+    0 2px 6px rgba(0, 0, 0, 0.5);
+  border-radius: 0px;
+  pointer-events: none;
+  z-index: 10;
+}
+.gray-swatch {
+  position: absolute;
+  top: 21px;
+  left: 17px;
+  width: 18px;
+  height: 18px;
+  background: #ddd;
+  border: 1px solid rgb(255, 255, 255);
+  box-shadow:
+    0 0 0 1px #111,
+    0 1px 4px rgba(0, 0, 0, 0.4);
+  border-radius: 0px;
+  pointer-events: auto;
+  cursor: default;
+  z-index: 9;
+}
+
+.hueArea {
+  flex: 0 0 20px;
+  position: relative;
+  margin-left: 18px;
+  min-height: 0;
+}
+#hueCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: default;
+}
+.marker-hue {
+  position: absolute;
+  left: -10px;
+  right: auto;
+  top: 0;
+  width: 10px;
+  height: 12px;
+  background: none !important;
+  box-shadow: none !important;
+  border: none !important;
+  pointer-events: none;
+  transform: translateY(-50%);
+  will-change: transform;
+}
+
+.setting-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative; 
+  z-index: 1; 
+}
+
+.setting-group label {
+  font-size: 11px;
+  color: #aaa;
+}
+.setting-group input {
+  background: #444444;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 0 8px;
+  height: 24px;
+  line-height: 24px;
+  box-sizing: border-box;
+  color: #e0e0e0;
+  font-size: 12px;
+  outline: none;
+}
+.setting-group input[type="number"] {
+  width: 80px;
+}
+.setting-group input:focus {
+  border-color: #0d99ff;
+}
+.hint {
+  font-size: 10px;
+  color: #666;
+  margin-top: 2px;
+}
+.dialog-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.warning-icon {
+  position: absolute;
+  top: 33px;
+  left: 8px;
+  width: 12px;
+  height: 14px;
+  pointer-events: none;
+  z-index: 8;
+  transform: translate(0px, 20px);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.alt-swatch {
+  position: absolute;
+  top: 54px;
+  left: 24px;
+  width: 11px;
+  height: 11px;
+  border: 1px solid rgb(255, 255, 255);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.7),
+    0 2px 6px rgba(0, 0, 0, 0.5);
+  border-radius: 0px;
+  pointer-events: none;
+  z-index: 8;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.custom-dropdown {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: 28px;
+  background: #444444;
+  border: 1px solid #555;
+  border-radius: 4px;
+  color: #e0e0e0;
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.dropdown-selected {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  justify-content: space-between;
+  box-sizing: border-box;
+}
+
+.dropdown-options {
+  display: none;
+  position: absolute;
+  bottom: 100%; 
+  left: -1px;
+  right: -1px;
+  background: rgba(184, 184, 184, 0.95);
+  border: 1px solid #aaa;
+  border-bottom: none; 
+  border-radius: 8px 8px 8px 8px; 
+  z-index: 100;
+  overflow: hidden;
+  margin-bottom: -1px; 
+  padding: 4px 0;
+}
+
+.custom-dropdown.open {
+  border-radius: 0 0 4px 4px;
+  z-index: 10; 
+}
+
+.custom-dropdown.open .dropdown-options {
+  display: block;
+}
+.dropdown-option {
+  margin: 1px 5px; 
+  padding: 0 8px 0 16px; 
+  height: 22px;
+  line-height: 22px;
+  box-sizing: border-box;
+  color: #222;
+  border-radius: 4px; 
+}
+
+.dropdown-option:hover {
+  background: #1878e3;
+  color: #fff; 
+}
+
+.setting-group.dropdown-open {
+  z-index: 100 !important;
+}
+
+.hide-native-inputs input {
+  visibility: hidden;
+}
+.dropdown-divider {
+  height: 1px;
+  background-color: #999; 
+  margin: 6px 12px; 
+}
+
+---=== t.py ===---
+print(184/16)
+
+---=== asset/cmyk_boundary.bin ===---
+[binary file omitted -- 45.0 KB]
+
+---=== asset/hsg_to_sv_down.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/hsv_to_gray_down.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== asset/visual_hsg2sv_dark.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/visual_hsg2sv_default.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/visual_hsg2sv_dotgain15.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/visual_hsg2sv_gamma22.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/visual_hsg2sv_light.bin ===---
+[binary file omitted -- 1.4 MB]
+
+---=== asset/visual_hsv2g_dark.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== asset/visual_hsv2g_default.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== asset/visual_hsv2g_dotgain15.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== asset/visual_hsv2g_gamma22.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== asset/visual_hsv2g_light.bin ===---
+[binary file omitted -- 720.0 KB]
+
+---=== images/icon@1x.png ===---
+[binary file omitted -- 357 bytes]
+
+---=== images/icon@2x.png ===---
+[binary file omitted -- 607 bytes]

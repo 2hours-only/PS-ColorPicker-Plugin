@@ -1,0 +1,67 @@
+{
+  "id": "com.rax.lutpicker",
+  "name": "LUT Color Picker",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "PS",
+    "minVersion": "24.0.0"
+  },
+  "requiredPermissions": {
+    "executeAsModal": true
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "com.rax.lutpicker.panel",
+      "label": "颜色",
+      "minimumSize": { "width": 200, "height": 130 },
+      "maximumSize": { "width": 800, "height": 900 },
+      "preferredDockedSize": { "width": 370, "height": 300 },
+      "preferredFloatingSize": { "width": 370, "height": 300 },
+      "icons": [
+        {
+          "width": 32, "height": 32,
+          "path": "images/icon@1x.png",
+          "scale": [1, 2],
+          "theme": ["dark", "darkest"],
+          "species": ["generic"]
+        },
+        {
+          "width": 32, "height": 32,
+          "path": "images/icon@2x.png",
+          "scale": [1, 2],
+          "theme": ["lightest", "light"],
+          "species": ["generic"]
+        }
+      ],
+      "menu": [
+        { "id": "showPicker", "label": "色相立方体" },
+        { "id": "showSettings", "label": "设置" },
+        { "id": "showInfo", "label": "信息" }
+      ]
+    },
+    {
+      "type": "command",
+      "id": "toggleLUTMode",
+      "label": "Toggle LUT Mode"
+    }
+  ],
+  "icons": [
+    {
+      "width": 32, "height": 32,
+      "path": "images/icon@1x.png",
+      "scale": [1, 2],
+      "theme": ["dark", "darkest"],
+      "species": ["pluginList"]
+    },
+    {
+      "width": 32, "height": 32,
+      "path": "images/icon@2x.png",
+      "scale": [1, 2],
+      "theme": ["lightest", "light"],
+      "species": ["pluginList"]
+    }
+  ]
+}

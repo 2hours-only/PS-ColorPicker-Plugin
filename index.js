@@ -1,0 +1,1975 @@
+const { core, app, action } = require("photoshop");
+const { entrypoints } = require("uxp");
+
+let cachedBlackGrad = null;
+let currentHue = 0;
+let currentS = 1;
+let currentV = 1;
+let cycleState = 0;
+let targetGray = null;
+let isUpdatingFromPlugin = false;
+let colorCheckTimer = null;
+let isBgRedrawScheduled = false;
+let pendingBgUpdate = false;
+let initialized = false;
+let settingsBeforeDialog = null;
+let settingsBeforePanel = null;
+let svArea, hueArea, svCanvas, hueCanvas, svCtx, hueCtx;
+let svMarker, hueMarker, swatch, graySwatch;
+let altSwatch;
+let warningIcon;
+let svAreaRect = null;
+let hueAreaRect = null;
+let lastColorStr = "";
+let lastBackgroundStr = "";
+let lastAltColorStr = "";
+let activeTarget = "foreground";
+let foregroundHue = 0;
+let foregroundS = 1;
+let foregroundV = 1;
+let backgroundHue = 0;
+let backgroundS = 1;
+let backgroundV = 1;
+const DEFAULT_CUSTOM_PARAMS = [100, 100, 100, 100, 100, 100];
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+function clamp255(value) {
+  return Math.max(0, Math.min(255, value));
+}
+function normalizeCustomParams(values) {
+  return (values || DEFAULT_CUSTOM_PARAMS).map((value) => {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 100;
+    return Math.max(0, Math.min(100, Math.round(num)));
+  });
+}
+function getCustomParamsFromSettings(settings) {
+  if (settings && Array.isArray(settings.customParams)) {
+    return normalizeCustomParams(settings.customParams);
+  }
+  return [...DEFAULT_CUSTOM_PARAMS];
+}
+function computeHueGray(params, hueDeg) {
+  const [R, Y, G, C, B, M] = params;
+  const hues = [0, 60, 120, 180, 240, 300, 360];
+  const grays = [R, Y, G, C, B, M, R];
+  const h = ((hueDeg % 360) + 360) % 360;
+  for (let i = 0; i < 6; i++) {
+    if (h >= hues[i] && h <= hues[i + 1]) {
+      const t = (h - hues[i]) / (hues[i + 1] - hues[i]);
+      return grays[i] * (1.0 - t) + grays[i + 1] * t;
+    }
+  }
+  return grays[0];
+}
+function bwModel(params, hueDeg, s01, v01) {
+  const grayH = computeHueGray(params, hueDeg);
+  const sN = clamp01(s01);
+  const vN = clamp01(v01);
+  const gray = ((1.0 - sN) * vN * 100.0 + sN * vN * grayH) * (255.0 / 100.0);
+  return Math.round(clamp255(gray));
+}
+function solveReversePair(params, grayH, s01, targetGray) {
+  const sN = clamp01(s01);
+  const target = clamp255(targetGray);
+  const a = 100.0 + sN * (grayH - 100.0);
+  const maxGray = (255.0 / 100.0) * a;
+  if (target <= maxGray + 1e-6) {
+    const v1 = target / Math.max(1e-6, maxGray);
+    return [Math.round(sN * 255.0), Math.round(clamp01(v1) * 255.0)];
+  }
+  if (Math.abs(grayH - 100.0) < 1e-6) {
+    return [Math.round(sN * 255.0), 255];
+  }
+  const scaledTarget = (target * 100.0) / 255.0;
+  const sCandidate = (scaledTarget - 100.0) / (grayH - 100.0);
+  const s1 = Math.max(0.0, Math.min(sN, sCandidate));
+  return [Math.round(s1 * 255.0), 255];
+}
+function generateCustomLut(params) {
+  const H = 45;
+  const S = 128;
+  const G = 128;
+  const gray = new Uint8Array(H * S * S);
+  const sv = new Uint8Array(H * S * G * 2);
+  const hueGrayCache = [];
+  for (let hIdx = 0; hIdx < H; hIdx++) {
+    hueGrayCache[hIdx] = computeHueGray(params, hIdx * 8);
+  }
+  for (let hIdx = 0; hIdx < H; hIdx++) {
+    const grayH = hueGrayCache[hIdx];
+    for (let sIdx = 0; sIdx < S; sIdx++) {
+      const s01 = sIdx / (S - 1);
+      for (let vIdx = 0; vIdx < S; vIdx++) {
+        const v01 = vIdx / (S - 1);
+        const flat = ((hIdx * S + sIdx) * S + vIdx) | 0;
+        gray[flat] = bwModel(params, hIdx * 8, s01, v01);
+      }
+      for (let gIdx = 0; gIdx < G; gIdx++) {
+        const targetGray = Math.min(255, Math.max(0, gIdx * 2));
+        const [sOut, vOut] = solveReversePair(params, grayH, s01, targetGray);
+        const flat = ((hIdx * S + sIdx) * G + gIdx) * 2;
+        sv[flat] = sOut;
+        sv[flat + 1] = vOut;
+      }
+    }
+  }
+  return { gray, sv };
+}
+const SentenceManager = {
+  allSentences: [],
+  recentSentences: [],
+  historyLimit: 0,
+  loaded: false,
+  async load() {
+    if (this.loaded) return;
+    try {
+      const fs = require("uxp").storage.localFileSystem;
+      const pluginFolder = await fs.getPluginFolder();
+      const sentenceFolder = await pluginFolder.getEntry("sentence");
+      const entries = await sentenceFolder.getEntries();
+      for (const entry of entries) {
+        if (entry.isFile && entry.name.toLowerCase().endsWith(".txt")) {
+          const content = await entry.read();
+
+          const lines = content
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0);
+          this.allSentences.push(...lines);
+        }
+      }
+      this.historyLimit = Math.floor(0.7 * this.allSentences.length);
+
+      if (this.historyLimit >= this.allSentences.length) {
+        this.historyLimit = Math.max(0, this.allSentences.length - 1);
+      }
+      console.log(`Loaded ${this.allSentences.length} sentences.`);
+    } catch (e) {
+      console.error("Failed to load sentences:", e);
+      this.allSentences = [
+        "",
+      ];
+    }
+    this.loaded = true;
+  },
+  getRandomSentence() {
+    if (this.allSentences.length === 0) return "无可用句子";
+
+    if (
+      this.historyLimit >= this.allSentences.length - 1 &&
+      this.recentSentences.length > this.historyLimit
+    ) {
+      this.recentSentences = [];
+    }
+    let sentence;
+    let attempts = 0;
+    do {
+      const idx = Math.floor(Math.random() * this.allSentences.length);
+      sentence = this.allSentences[idx];
+      attempts++;
+      if (attempts > 100) break;
+    } while (this.recentSentences.includes(sentence));
+
+    this.recentSentences.push(sentence);
+    if (this.recentSentences.length > this.historyLimit) {
+      this.recentSentences.shift();
+    }
+    return sentence;
+  },
+};
+
+const LUT = {
+  gray: null,
+  sv: null,
+  boundary: null,
+  ready: false,
+  H: 45,
+  S: 128,
+  G: 128,
+  HF: 4,
+  SF: 2,
+  async init(presetKey = "1") {
+    if (presetKey === "6") {
+      const customParams = getCustomParamsFromSettings(activeSettings);
+      const generated = generateCustomLut(customParams);
+      this.gray = generated.gray;
+      this.sv = generated.sv;
+      this.ready = true;
+      redraw(true);
+      console.log("✅ 自定义 LUT 已生成");
+      return;
+    }
+    const suffixMap = {
+      1: "default",
+      2: "light",
+      3: "dark",
+      4: "dotgain15",
+      5: "gamma22",
+    };
+    const suffix = suffixMap[presetKey] || "default";
+    try {
+      const grayResp = await fetch(`./asset/visual_hsv2g_${suffix}.bin`);
+      const grayBuf = await grayResp.arrayBuffer();
+      await new Promise((r) => setTimeout(r, 0));
+      const svResp = await fetch(`./asset/visual_hsg2sv_${suffix}.bin`);
+      const svBuf = await svResp.arrayBuffer();
+      if (!this.boundary) {
+        await new Promise((r) => setTimeout(r, 0));
+        const boundaryResp = await fetch("./asset/cmyk_boundary.bin");
+        const boundaryBuf = await boundaryResp.arrayBuffer();
+        this.boundary = new Uint8Array(boundaryBuf);
+      }
+      this.gray = new Uint8Array(grayBuf);
+      this.sv = new Uint8Array(svBuf);
+      this.ready = true;
+      redraw(true);
+      console.log(`✅ LUT 预设加载成功: ${suffix}`);
+    } catch (e) {
+      console.warn("❌ LUT load failed:", e);
+    }
+  },
+  _lerp3(arr, d0, d1, d2, f0, f1, f2) {
+    const i0 = f0 | 0,
+      i1 = f1 | 0,
+      i2 = f2 | 0;
+    const j0 = Math.min(i0 + 1, d0 - 1);
+    const j1 = Math.min(i1 + 1, d1 - 1);
+    const j2 = Math.min(i2 + 1, d2 - 1);
+    const a = f0 - i0,
+      b = f1 - i1,
+      c = f2 - i2;
+    const x = 1 - a,
+      y = 1 - b,
+      z = 1 - c;
+    const p = (a0, a1, a2) => a0 * d1 * d2 + a1 * d2 + a2;
+    return (
+      arr[p(i0, i1, i2)] * x * y * z +
+      arr[p(j0, i1, i2)] * a * y * z +
+      arr[p(i0, j1, i2)] * x * b * z +
+      arr[p(j0, j1, i2)] * a * b * z +
+      arr[p(i0, i1, j2)] * x * y * c +
+      arr[p(j0, i1, j2)] * a * y * c +
+      arr[p(i0, j1, j2)] * x * b * c +
+      arr[p(j0, j1, j2)] * a * b * c
+    );
+  },
+  _lerp3c2(arr, d0, d1, d2, f0, f1, f2) {
+    const i0 = f0 | 0,
+      i1 = f1 | 0,
+      i2 = f2 | 0;
+    const j0 = Math.min(i0 + 1, d0 - 1);
+    const j1 = Math.min(i1 + 1, d1 - 1);
+    const j2 = Math.min(i2 + 1, d2 - 1);
+    const a = f0 - i0,
+      b = f1 - i1,
+      c = f2 - i2;
+    const x = 1 - a,
+      y = 1 - b,
+      z = 1 - c;
+    const p = (a0, a1, a2, ch) => (a0 * d1 * d2 + a1 * d2 + a2) * 2 + ch;
+    const res = [0, 0];
+    for (let ch = 0; ch < 2; ch++) {
+      res[ch] = Math.round(
+        arr[p(i0, i1, i2, ch)] * x * y * z +
+          arr[p(j0, i1, i2, ch)] * a * y * z +
+          arr[p(i0, j1, i2, ch)] * x * b * z +
+          arr[p(j0, j1, i2, ch)] * a * b * z +
+          arr[p(i0, i1, j2, ch)] * x * y * c +
+          arr[p(j0, i1, j2, ch)] * a * y * c +
+          arr[p(i0, j1, j2, ch)] * x * b * c +
+          arr[p(j0, j1, j2, ch)] * a * b * c,
+      );
+    }
+    return res;
+  },
+  _hf(hueDeg) {
+    return Math.max(0, Math.min(this.H - 1, hueDeg / (2 * this.HF)));
+  },
+  _sf(v01) {
+    return Math.max(0, Math.min(this.S - 1, (v01 * 255) / this.SF));
+  },
+  _gf(gray) {
+    return Math.max(0, Math.min(this.G - 1, gray / this.SF));
+  },
+  grayFromHsv(hueDeg, s01, v01) {
+    if (!this.ready) return null;
+    return this._lerp3(
+      this.gray,
+      this.H,
+      this.S,
+      this.S,
+      this._hf(hueDeg),
+      this._sf(s01),
+      this._sf(v01),
+    );
+  },
+  svFromHsg(hueDeg, s01, gray) {
+    if (!this.ready) return null;
+    return this._lerp3c2(
+      this.sv,
+      this.H,
+      this.S,
+      this.G,
+      this._hf(hueDeg),
+      this._sf(s01),
+      this._gf(gray),
+    );
+  },
+  boundaryFromHs(hueDeg, s01) {
+    if (!this.boundary) return 1.0;
+    const h_idx = Math.round(hueDeg / 2) % 180;
+    const s_idx = Math.min(255, Math.max(0, Math.round(s01 * 255)));
+    const offset = h_idx * 256 + s_idx;
+    return this.boundary[offset] / 255.0;
+  },
+};
+
+function setMode(enabled) {
+  const newState = enabled ? 1 : 0;
+  if (cycleState !== newState) {
+    cycleState = newState;
+    if (cycleState === 0) {
+      console.log("🟡 状态 0 (Mode Disabled)");
+    } else {
+      console.log("🔴 状态 1 (Mode Enabled)");
+      if (LUT.ready)
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+    }
+    scheduleVisualUpdate(false);
+  }
+}
+function updateGuideLinesBtnState() {}
+
+function switchToView(viewId) {
+  const viewPicker = document.getElementById("viewPicker");
+  const viewSettings = document.getElementById("viewSettings");
+  if (viewId === "showPicker") {
+    if (viewPicker) viewPicker.style.display = "flex";
+    if (viewSettings) viewSettings.style.display = "none";
+    setTimeout(() => {
+      resizeCanvases();
+      redraw(true);
+      drawHueBackground();
+    }, 100);
+  } else if (viewId === "showSettings") {
+    if (viewPicker) viewPicker.style.display = "none";
+    if (viewSettings) viewSettings.style.display = "flex";
+  }
+}
+function updateCustomParamDisplay(container) {
+  if (!container) return;
+  const inputs = container.querySelectorAll('input[type="range"]');
+  inputs.forEach((input) => {
+    const valueEl = container.querySelector(`#${input.id}Value`);
+    if (valueEl) valueEl.textContent = input.value;
+  });
+}
+function bindCustomParamPanel(container) {
+  if (!container) return;
+  const inputs = container.querySelectorAll('input[type="range"]');
+  inputs.forEach((input) => {
+    const updateValue = () => updateCustomParamDisplay(container);
+    input.addEventListener("input", updateValue);
+    input.addEventListener("change", updateValue);
+  });
+  updateCustomParamDisplay(container);
+}
+function setCustomParamValues(container, customParams) {
+  if (!container) return;
+  const values = Array.isArray(customParams)
+    ? customParams
+    : [...DEFAULT_CUSTOM_PARAMS];
+  const inputs = container.querySelectorAll('input[type="range"]');
+  inputs.forEach((input, index) => {
+    const nextValue = Math.max(1, Math.min(100, Number(values[index]) || 100));
+    input.value = nextValue;
+  });
+  updateCustomParamDisplay(container);
+}
+function updateCustomParamsVisibility(configValue) {
+  const isCustom = configValue === "6";
+  const applyState = (container) => {
+    if (!container) return;
+    container.classList.toggle("disabled", !isCustom);
+    const inputs = container.querySelectorAll('input[type="range"]');
+    inputs.forEach((input) => {
+      input.disabled = !isCustom;
+      input.style.cursor = isCustom ? "pointer" : "not-allowed";
+    });
+    const values = container.querySelectorAll(".custom-param-value");
+    values.forEach((valueEl) => {
+      valueEl.style.opacity = isCustom ? "1" : "0.7";
+    });
+  };
+  applyState(dlgCustomParamsGroup);
+  applyState(panelCustomParamsGroup);
+}
+function keepAtLeastOneGuideType(changed, other) {
+  if (changed && other && !changed.checked && !other.checked) {
+    other.checked = true;
+  }
+}
+function clampOpacityInput(input, fallback = 15) {
+  let value = parseInt(input ? input.value : fallback, 10);
+  if (isNaN(value) || value < 0) value = 0;
+  return Math.min(100, value);
+}
+function loadSettingsToPanel() {
+  const currentSettings = loadSettings();
+  settingsBeforePanel = JSON.parse(JSON.stringify(currentSettings));
+
+  const panelDesc = document.getElementById("panel_desc");
+  if (panelDesc) {
+    panelDesc.textContent = SentenceManager.getRandomSentence();
+  }
+
+  panelHLines.value = currentSettings.hLines;
+  panelVLines.value = currentSettings.vLines;
+  panelEnableMode.checked = currentSettings.enableMode;
+  panelShowGuideLines.checked = currentSettings.showGuideLines;
+  panelShowHorizontalLines.checked = currentSettings.showHorizontalLines;
+  panelShowEqualBrightnessLines.checked =
+    currentSettings.showEqualBrightnessLines;
+  panelHorizontalLineOpacity.value = currentSettings.horizontalLineOpacity;
+  panelEqualBrightnessLineOpacity.value =
+    currentSettings.equalBrightnessLineOpacity;
+  panelHueLines.value = currentSettings.hueLines;
+  const isSeparate = currentSettings.useSeparateHV;
+
+  panelUseSeparateHV.checked = isSeparate;
+  panelVLines.disabled = !isSeparate;
+  panelVLines.style.backgroundColor = isSeparate ? "#444444" : "#4d4d4d";
+  const configValue = currentSettings.colorConfig || "1";
+  const selectedText = panelUpdateColorConfig.querySelector(".selected-text");
+  const matchedOption = panelUpdateColorConfig.querySelector(
+    `.dropdown-option[data-value="${configValue}"]`,
+  );
+  if (selectedText)
+    selectedText.textContent = matchedOption
+      ? matchedOption.textContent
+      : "默认";
+  if (panelUpdateColorConfig)
+    panelUpdateColorConfig.setAttribute("data-value", configValue);
+  updateCustomParamsVisibility(configValue);
+  const customParams = getCustomParamsFromSettings(currentSettings);
+  setCustomParamValues(panelCustomParamsGroup, customParams);
+}
+
+function revertPanelSettings() {
+  if (settingsBeforePanel) {
+    console.log("↩️ 还原面板设置到打开前的状态");
+    activeSettings = JSON.parse(JSON.stringify(settingsBeforePanel));
+    saveSettings(activeSettings);
+    setMode(activeSettings.enableMode);
+    scheduleVisualUpdate(true);
+    settingsBeforePanel = null;
+  }
+}
+
+entrypoints.setup({
+  panels: {
+    "com.rax.lutpicker.panel": {
+      show() {
+        if (initialized) {
+          resizeCanvases();
+          return;
+        }
+        initialized = true;
+        requestAnimationFrame(() => {
+          delayedInit();
+        });
+      },
+      menuItems: [
+        { id: "showPicker", label: "色相立方体", enabled: true },
+        { id: "showSettings", label: "设置", enabled: true },
+        { id: "toggleLUTMode", label: "切换 LUT 模式", enabled: true },
+        { id: "toggleGuideLines", label: "显示/隐藏指示线", enabled: true },
+        { id: "showInfo", label: "信息", enabled: true },
+      ],
+      invokeMenu(id) {
+        console.log(`☰ 菜单点击: ${id}`);
+        if (id === "showPicker") {
+          if (
+            document.getElementById("viewSettings").style.display === "flex"
+          ) {
+            revertPanelSettings();
+          }
+          switchToView("showPicker");
+        } else if (id === "showSettings") {
+          loadSettingsToPanel();
+          switchToView("showSettings");
+        } else if (id === "toggleLUTMode") {
+          activeSettings.enableMode = !activeSettings.enableMode;
+          saveSettings(activeSettings);
+          setMode(activeSettings.enableMode);
+        } else if (id === "toggleGuideLines") {
+          activeSettings.showGuideLines = !activeSettings.showGuideLines;
+          saveSettings(activeSettings);
+          updateGuideLinesBtnState();
+          scheduleVisualUpdate(true);
+        }
+      },
+    },
+  },
+  commands: {
+  },
+});
+async function delayedInit() {
+  initDOM();
+  activeSettings = loadSettings();
+  setMode(activeSettings.enableMode);
+  updateGuideLinesBtnState();
+  bindEvents();
+  await SentenceManager.load();
+  requestAnimationFrame(() => {
+    initHeavy();
+  });
+}
+
+let activeSettings = null;
+
+let settingsDialog,
+  dlgEnableMode,
+  dlgShowGuideLines,
+  dlgUseSeparateHV,
+  dlgHLines,
+  dlgVLines,
+  dlgUpdateColorConfig;
+let panelEnableMode,
+  panelShowGuideLines,
+  panelUseSeparateHV,
+  panelHLines,
+  panelVLines,
+  panelUpdateColorConfig;
+let panelCancelBtn, panelSaveBtn;
+let dlgShowHorizontalLines,
+  dlgShowEqualBrightnessLines,
+  dlgHorizontalLineOpacity,
+  dlgEqualBrightnessLineOpacity;
+let panelShowHorizontalLines,
+  panelShowEqualBrightnessLines,
+  panelHorizontalLineOpacity,
+  panelEqualBrightnessLineOpacity;
+let dlgCustomR, dlgCustomY, dlgCustomG, dlgCustomC, dlgCustomB, dlgCustomM;
+let panelCustomR,
+  panelCustomY,
+  panelCustomG,
+  panelCustomC,
+  panelCustomB,
+  panelCustomM;
+let dlgCustomParamsGroup, panelCustomParamsGroup;
+
+const DEFAULT_SETTINGS = {
+  hLines: 1,
+  vLines: 1,
+  useSeparateHV: false,
+  enableMode: false,
+  showGuideLines: false,
+  guideLineOpacity: 15,
+  showHorizontalLines: true,
+  showEqualBrightnessLines: true,
+  horizontalLineOpacity: 15,
+  equalBrightnessLineOpacity: 15,
+  hueLines: 5,
+  colorConfig: "1",
+  customParams: [...DEFAULT_CUSTOM_PARAMS],
+};
+
+function loadSettings() {
+  try {
+    const saved = localStorage.getItem("lut_picker_settings");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed.enableMode === undefined) parsed.enableMode = false;
+      if (parsed.showGuideLines === undefined) parsed.showGuideLines = false;
+      if (parsed.useSeparateHV === undefined) parsed.useSeparateHV = false;
+      if (parsed.hLines === undefined) parsed.hLines = 1;
+      if (parsed.vLines === undefined) parsed.vLines = 1;
+      if (parsed.colorConfig === undefined) parsed.colorConfig = "1";
+      if (parsed.guideLineOpacity === undefined) parsed.guideLineOpacity = 15;
+      if (parsed.showHorizontalLines === undefined)
+        parsed.showHorizontalLines = true;
+      if (parsed.showEqualBrightnessLines === undefined)
+        parsed.showEqualBrightnessLines = true;
+      if (parsed.horizontalLineOpacity === undefined)
+        parsed.horizontalLineOpacity = parsed.guideLineOpacity;
+      if (parsed.equalBrightnessLineOpacity === undefined)
+        parsed.equalBrightnessLineOpacity = parsed.guideLineOpacity;
+      if (!parsed.showHorizontalLines && !parsed.showEqualBrightnessLines)
+        parsed.showHorizontalLines = true;
+      if (parsed.hueLines === undefined) parsed.hueLines = 5;
+      if (!Array.isArray(parsed.customParams)) {
+        parsed.customParams = [...DEFAULT_CUSTOM_PARAMS];
+      } else {
+        parsed.customParams = normalizeCustomParams(parsed.customParams);
+      }
+      return parsed;
+    }
+  } catch (e) {}
+  return { ...DEFAULT_SETTINGS };
+}
+
+function saveSettings(settings) {
+  try {
+    localStorage.setItem("lut_picker_settings", JSON.stringify(settings));
+  } catch (e) {}
+}
+
+function initDOM() {
+  svArea = document.getElementById("svArea");
+  hueArea = document.getElementById("hueArea");
+  svCanvas = document.getElementById("svCanvas");
+  hueCanvas = document.getElementById("hueCanvas");
+  svCtx = svCanvas.getContext("2d");
+  hueCtx = hueCanvas.getContext("2d");
+  svMarker = document.getElementById("svMarker");
+  hueMarker = document.getElementById("hueMarker");
+  swatch = document.getElementById("swatch");
+  graySwatch = document.getElementById("graySwatch");
+  altSwatch = document.getElementById("altSwatch");
+  settingsDialog = document.getElementById("settingsDialog");
+  dlgEnableMode = document.getElementById("dlg_enableMode");
+  dlgShowGuideLines = document.getElementById("dlg_showGuideLines");
+  dlgUseSeparateHV = document.getElementById("dlg_useSeparateHV");
+  dlgHLines = document.getElementById("dlg_hLines");
+  dlgVLines = document.getElementById("dlg_vLines");
+  dlgUpdateColorConfig = document.getElementById(
+    "dlg_updateColorConfigDropdown",
+  );
+  panelEnableMode = document.getElementById("panel_enableMode");
+  panelShowGuideLines = document.getElementById("panel_showGuideLines");
+  panelUseSeparateHV = document.getElementById("panel_useSeparateHV");
+  panelHLines = document.getElementById("panel_hLines");
+  panelVLines = document.getElementById("panel_vLines");
+  panelUpdateColorConfig = document.getElementById(
+    "panel_updateColorConfigDropdown",
+  );
+  panelCancelBtn = document.getElementById("panel_cancelBtn");
+  panelSaveBtn = document.getElementById("panel_saveBtn");
+  dlgShowHorizontalLines = document.getElementById("dlg_showHorizontalLines");
+  dlgShowEqualBrightnessLines = document.getElementById(
+    "dlg_showEqualBrightnessLines",
+  );
+  dlgHorizontalLineOpacity = document.getElementById(
+    "dlg_horizontalLineOpacity",
+  );
+  dlgEqualBrightnessLineOpacity = document.getElementById(
+    "dlg_equalBrightnessLineOpacity",
+  );
+  panelShowHorizontalLines = document.getElementById(
+    "panel_showHorizontalLines",
+  );
+  panelShowEqualBrightnessLines = document.getElementById(
+    "panel_showEqualBrightnessLines",
+  );
+  panelHorizontalLineOpacity = document.getElementById(
+    "panel_horizontalLineOpacity",
+  );
+  panelEqualBrightnessLineOpacity = document.getElementById(
+    "panel_equalBrightnessLineOpacity",
+  );
+  dlgCustomParamsGroup = document.getElementById("dlg_customParamsGroup");
+  panelCustomParamsGroup = document.getElementById("panel_customParamsGroup");
+  dlgCustomR = document.getElementById("dlg_customR");
+  dlgCustomY = document.getElementById("dlg_customY");
+  dlgCustomG = document.getElementById("dlg_customG");
+  dlgCustomC = document.getElementById("dlg_customC");
+  dlgCustomB = document.getElementById("dlg_customB");
+  dlgCustomM = document.getElementById("dlg_customM");
+  panelCustomR = document.getElementById("panel_customR");
+  panelCustomY = document.getElementById("panel_customY");
+  panelCustomG = document.getElementById("panel_customG");
+  panelCustomC = document.getElementById("panel_customC");
+  panelCustomB = document.getElementById("panel_customB");
+  panelCustomM = document.getElementById("panel_customM");
+
+  dlgHueLines = document.getElementById("dlg_hueLines");
+  panelHueLines = document.getElementById("panel_hueLines");
+
+  bindCustomParamPanel(dlgCustomParamsGroup);
+
+  bindCustomParamPanel(panelCustomParamsGroup);
+
+  const initDropdown = (elem) => {
+    if (elem) {
+      const selectedDisplay = elem.querySelector(".dropdown-selected");
+      if (selectedDisplay && !selectedDisplay.querySelector("svg")) {
+        selectedDisplay.insertAdjacentHTML(
+          "beforeend",
+          `<svg width="12" height="6" viewBox="0 0 12 6" style="display:block; flex-shrink:0;"><polyline points="2,5 6,1 10,5" fill="none" stroke="#aaa" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" /></svg>`,
+        );
+      }
+    }
+  };
+  initDropdown(dlgUpdateColorConfig);
+  initDropdown(panelUpdateColorConfig);
+  if (hueMarker) {
+    hueMarker.innerHTML = `<svg width="10" height="12" viewBox="0 0 10 12" style="display:block;"><polygon points="1.0,3.5 3.0,1.5 9.0,6 3.0,10.5 1.0,8.5" fill=#ddd stroke="black" stroke-width="1" stroke-linejoin="round" /></svg>`;
+  }
+  warningIcon = document.getElementById("warningIcon");
+  if (warningIcon) {
+    warningIcon.innerHTML = `<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block;"><polygon points="12,2 1,22 23,22" fill="#ddd" stroke="#ddd" stroke-width="1.5" stroke-linejoin="round" /><rect x="10.7" y="7" width="2.5" height="8" rx="1" fill="#333" /><circle cx="12" cy="18.5" r="1.5" fill="#333" /></svg>`;
+  }
+}
+
+function bindEvents() {
+  if (swatch) {
+    swatch.addEventListener("click", () => {
+      if (activeTarget === "foreground") {
+        if (
+          currentHue === foregroundHue &&
+          currentS === foregroundS &&
+          currentV === foregroundV
+        ) {
+          return;
+        }
+      }
+      activeTarget = "foreground";
+      setCurrentFromActiveTarget();
+      if (cycleState === 1 && LUT.ready) {
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+      }
+      scheduleVisualUpdate(true);
+    });
+  }
+  if (graySwatch) {
+    graySwatch.addEventListener("click", () => {
+      if (activeTarget === "background") {
+        if (
+          currentHue === backgroundHue &&
+          currentS === backgroundS &&
+          currentV === backgroundV
+        ) {
+          return;
+        }
+      }
+      activeTarget = "background";
+      setCurrentFromActiveTarget();
+      if (cycleState === 1 && LUT.ready) {
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+      }
+      scheduleVisualUpdate(true);
+    });
+  }
+
+  if (altSwatch) {
+    altSwatch.addEventListener("click", async () => {
+      if (!isTooVivid(currentHue, currentS, currentV)) return;
+      const altHsv = getAltColor(currentHue, currentS, currentV);
+      currentHue = altHsv.h;
+      currentS = altHsv.s;
+      currentV = altHsv.v;
+      if (cycleState === 1) {
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+      }
+      scheduleVisualUpdate(false);
+      const altRgb = hsvToRgb(altHsv.h, altHsv.s, altHsv.v);
+      isUpdatingFromPlugin = true;
+      try {
+        await core.executeAsModal(
+          async () => {
+            const newColor = app.foregroundColor;
+            newColor.rgb.red = altRgb.r;
+            newColor.rgb.green = altRgb.g;
+            newColor.rgb.blue = altRgb.b;
+            app.foregroundColor = newColor;
+          },
+          { commandName: "Set Alt Foreground Color" },
+        );
+      } catch (e) {
+        console.error("Set Alt Foreground Color failed:", e);
+      }
+      setTimeout(() => {
+        isUpdatingFromPlugin = false;
+      }, 200);
+    });
+  }
+  const dlgCancelBtn = document.getElementById("dlg_cancelBtn");
+  const dlgSaveBtn = document.getElementById("dlg_saveBtn");
+  if (dlgUseSeparateHV) {
+    dlgUseSeparateHV.addEventListener("change", () => {
+      const isSeparate = dlgUseSeparateHV.checked;
+      dlgVLines.disabled = !isSeparate;
+      dlgVLines.style.backgroundColor = isSeparate ? "#444444" : "#4d4d4d";
+    });
+  }
+  if (dlgEnableMode) {
+    dlgEnableMode.addEventListener("change", () => {
+      setMode(dlgEnableMode.checked);
+    });
+  }
+  if (dlgShowGuideLines) {
+    dlgShowGuideLines.addEventListener("change", () => {
+      activeSettings.showGuideLines = dlgShowGuideLines.checked;
+      scheduleVisualUpdate(true);
+    });
+  }
+  const bindDropdown = (elem) => {
+    if (!elem) return;
+    const selectedDisplay = elem.querySelector(".dropdown-selected");
+    const selectedText = elem.querySelector(".selected-text");
+    const optionsContainer = elem.querySelector(".dropdown-options");
+    const handleOverlapInputs = (isOpen) => {
+      const parentGroup = elem.closest(".setting-group");
+      if (!parentGroup) return;
+      const prev1 = parentGroup.previousElementSibling;
+      const prev2 = prev1 ? prev1.previousElementSibling : null;
+      if (isOpen) {
+        parentGroup.classList.add("dropdown-open");
+        if (prev1) prev1.classList.add("hide-native-inputs");
+        if (prev2) prev2.classList.add("hide-native-inputs");
+      } else {
+        parentGroup.classList.remove("dropdown-open");
+        if (prev1) prev1.classList.remove("hide-native-inputs");
+        if (prev2) prev2.classList.remove("hide-native-inputs");
+      }
+    };
+    selectedDisplay.addEventListener("click", () => {
+      elem.classList.toggle("open");
+      handleOverlapInputs(elem.classList.contains("open"));
+    });
+    optionsContainer.addEventListener("click", (e) => {
+      const target = e.target.closest(".dropdown-option");
+      if (target) {
+        const value = target.getAttribute("data-value");
+        selectedText.textContent = target.textContent;
+        elem.setAttribute("data-value", value);
+        elem.classList.remove("open");
+        handleOverlapInputs(false);
+      }
+    });
+    document.addEventListener("click", (e) => {
+      if (!elem.contains(e.target)) {
+        if (elem.classList.contains("open")) {
+          elem.classList.remove("open");
+          handleOverlapInputs(false);
+        }
+      }
+    });
+  };
+  bindDropdown(dlgUpdateColorConfig);
+  bindDropdown(panelUpdateColorConfig);
+  if (dlgUpdateColorConfig) {
+    const syncVisibility = () => {
+      const val = dlgUpdateColorConfig.getAttribute("data-value") || "1";
+      updateCustomParamsVisibility(val);
+    };
+    syncVisibility();
+    dlgUpdateColorConfig.addEventListener("click", syncVisibility);
+  }
+  if (panelUpdateColorConfig) {
+    const syncVisibility = () => {
+      const val = panelUpdateColorConfig.getAttribute("data-value") || "1";
+      updateCustomParamsVisibility(val);
+    };
+    syncVisibility();
+    panelUpdateColorConfig.addEventListener("click", syncVisibility);
+  }
+  if (settingsDialog) {
+    settingsDialog.addEventListener("cancel", () => {
+      revertSettings();
+    });
+    settingsDialog.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        const activeEl = document.activeElement;
+        if (activeEl && activeEl.tagName === "INPUT") {
+          activeEl.blur();
+          settingsDialog.focus();
+        } else {
+          if (dlgSaveBtn) dlgSaveBtn.click();
+        }
+      }
+    });
+  }
+  function revertSettings() {
+    if (settingsBeforeDialog) {
+      console.log("↩️ 还原设置到打开前的状态");
+      activeSettings = JSON.parse(JSON.stringify(settingsBeforeDialog));
+      saveSettings(activeSettings);
+      setMode(activeSettings.enableMode);
+      scheduleVisualUpdate(true);
+      dlgHLines.value = activeSettings.hLines;
+      dlgVLines.value = activeSettings.vLines;
+      dlgEnableMode.checked = activeSettings.enableMode;
+      dlgShowGuideLines.checked = activeSettings.showGuideLines;
+      const isSeparate = activeSettings.useSeparateHV;
+      dlgUseSeparateHV.checked = isSeparate;
+      dlgVLines.disabled = !isSeparate;
+      dlgVLines.style.backgroundColor = isSeparate ? "#444444" : "#4d4d4d";
+
+      dlgShowHorizontalLines.checked = activeSettings.showHorizontalLines;
+      dlgShowEqualBrightnessLines.checked =
+        activeSettings.showEqualBrightnessLines;
+      dlgHorizontalLineOpacity.value = activeSettings.horizontalLineOpacity;
+      dlgEqualBrightnessLineOpacity.value =
+        activeSettings.equalBrightnessLineOpacity;
+      dlgHueLines.value = activeSettings.hueLines;
+
+      const selTextEl = dlgUpdateColorConfig
+        ? dlgUpdateColorConfig.querySelector(".selected-text")
+        : null;
+
+      const configValToRevert = activeSettings.colorConfig || "1";
+      const matchedOptionRevert = dlgUpdateColorConfig
+        ? dlgUpdateColorConfig.querySelector(
+            `.dropdown-option[data-value="${configValToRevert}"]`,
+          )
+        : null;
+      if (selTextEl)
+        selTextEl.textContent = matchedOptionRevert
+          ? matchedOptionRevert.textContent
+          : "默认";
+      if (dlgUpdateColorConfig)
+        dlgUpdateColorConfig.setAttribute("data-value", configValToRevert);
+      updateCustomParamsVisibility(configValToRevert);
+      const customParams = getCustomParamsFromSettings(activeSettings);
+      setCustomParamValues(dlgCustomParamsGroup, customParams);
+      settingsBeforeDialog = null;
+    }
+  }
+  if (dlgCancelBtn) {
+    dlgCancelBtn.addEventListener("click", () => {
+      revertSettings();
+      settingsDialog.close("cancel");
+    });
+  }
+  if (dlgSaveBtn) {
+    dlgSaveBtn.addEventListener("click", async () => {
+      let hVal = parseInt(dlgHLines.value, 10);
+      if (isNaN(hVal) || hVal < 0) hVal = 0;
+      if (hVal > 15) hVal = 15;
+      let vVal = parseInt(dlgVLines.value, 10);
+      if (isNaN(vVal) || vVal < 0) vVal = 0;
+      if (vVal > 15) vVal = 15;
+
+      const horizontalOpacityVal = clampOpacityInput(
+        dlgHorizontalLineOpacity,
+      );
+      const equalBrightnessOpacityVal = clampOpacityInput(
+        dlgEqualBrightnessLineOpacity,
+      );
+
+      let hueVal = parseInt(dlgHueLines.value, 10);
+      if (isNaN(hueVal) || hueVal < 0) hueVal = 0;
+      if (hueVal > 15) hueVal = 15;
+
+      const configVal = dlgUpdateColorConfig
+        ? dlgUpdateColorConfig.getAttribute("data-value")
+        : "1";
+
+      const customParams = [
+        dlgCustomR ? Number(dlgCustomR.value) : 100,
+        dlgCustomY ? Number(dlgCustomY.value) : 100,
+        dlgCustomG ? Number(dlgCustomG.value) : 100,
+        dlgCustomC ? Number(dlgCustomC.value) : 100,
+        dlgCustomB ? Number(dlgCustomB.value) : 100,
+        dlgCustomM ? Number(dlgCustomM.value) : 100,
+      ];
+      const newSettings = {
+        hLines: hVal,
+        vLines: vVal,
+        useSeparateHV: dlgUseSeparateHV.checked,
+        enableMode: dlgEnableMode.checked,
+        showGuideLines: dlgShowGuideLines.checked,
+        showHorizontalLines: dlgShowHorizontalLines.checked,
+        showEqualBrightnessLines: dlgShowEqualBrightnessLines.checked,
+        colorConfig: configVal,
+        customParams: normalizeCustomParams(customParams),
+        guideLineOpacity: Math.max(
+          horizontalOpacityVal,
+          equalBrightnessOpacityVal,
+        ),
+        horizontalLineOpacity: horizontalOpacityVal,
+        equalBrightnessLineOpacity: equalBrightnessOpacityVal,
+        hueLines: hueVal,
+      };
+
+      console.log("✅ 保存设置:", newSettings);
+      saveSettings(newSettings);
+      activeSettings = newSettings;
+      setMode(activeSettings.enableMode);
+      updateGuideLinesBtnState();
+      await LUT.init(configVal);
+      scheduleVisualUpdate(true);
+      settingsBeforeDialog = null;
+      settingsDialog.close("save");
+    });
+  }
+  if (panelUseSeparateHV) {
+    panelUseSeparateHV.addEventListener("change", () => {
+      const isSeparate = panelUseSeparateHV.checked;
+      panelVLines.disabled = !isSeparate;
+      panelVLines.style.backgroundColor = isSeparate ? "#444444" : "#4d4d4d";
+    });
+  }
+  if (panelEnableMode) {
+    panelEnableMode.addEventListener("change", () => {
+      setMode(panelEnableMode.checked);
+    });
+  }
+  if (panelShowGuideLines) {
+    panelShowGuideLines.addEventListener("change", () => {
+      activeSettings.showGuideLines = panelShowGuideLines.checked;
+      scheduleVisualUpdate(true);
+    });
+  }
+  if (dlgShowHorizontalLines) {
+    dlgShowHorizontalLines.addEventListener("change", () => {
+      keepAtLeastOneGuideType(
+        dlgShowHorizontalLines,
+        dlgShowEqualBrightnessLines,
+      );
+    });
+  }
+  if (dlgShowEqualBrightnessLines) {
+    dlgShowEqualBrightnessLines.addEventListener("change", () => {
+      keepAtLeastOneGuideType(
+        dlgShowEqualBrightnessLines,
+        dlgShowHorizontalLines,
+      );
+    });
+  }
+  if (panelShowHorizontalLines) {
+    panelShowHorizontalLines.addEventListener("change", () => {
+      keepAtLeastOneGuideType(
+        panelShowHorizontalLines,
+        panelShowEqualBrightnessLines,
+      );
+    });
+  }
+  if (panelShowEqualBrightnessLines) {
+    panelShowEqualBrightnessLines.addEventListener("change", () => {
+      keepAtLeastOneGuideType(
+        panelShowEqualBrightnessLines,
+        panelShowHorizontalLines,
+      );
+    });
+  }
+  if (panelCancelBtn) {
+    panelCancelBtn.addEventListener("click", () => {
+      revertPanelSettings();
+      switchToView("showPicker");
+    });
+  }
+  if (panelSaveBtn) {
+    panelSaveBtn.addEventListener("click", async () => {
+      let hVal = parseInt(panelHLines.value, 10);
+      if (isNaN(hVal) || hVal < 0) hVal = 0;
+      if (hVal > 15) hVal = 15;
+      let vVal = parseInt(panelVLines.value, 10);
+      if (isNaN(vVal) || vVal < 0) vVal = 0;
+      if (vVal > 15) vVal = 15;
+
+      const horizontalOpacityVal = clampOpacityInput(
+        panelHorizontalLineOpacity,
+      );
+      const equalBrightnessOpacityVal = clampOpacityInput(
+        panelEqualBrightnessLineOpacity,
+      );
+
+      let hueVal = parseInt(panelHueLines.value, 10);
+      if (isNaN(hueVal) || hueVal < 0) hueVal = 0;
+      if (hueVal > 15) hueVal = 15;
+
+      const configVal = panelUpdateColorConfig
+        ? panelUpdateColorConfig.getAttribute("data-value")
+        : "1";
+
+      const customParams = [
+        panelCustomR ? Number(panelCustomR.value) : 100,
+        panelCustomY ? Number(panelCustomY.value) : 100,
+        panelCustomG ? Number(panelCustomG.value) : 100,
+        panelCustomC ? Number(panelCustomC.value) : 100,
+        panelCustomB ? Number(panelCustomB.value) : 100,
+        panelCustomM ? Number(panelCustomM.value) : 100,
+      ];
+      const newSettings = {
+        hLines: hVal,
+        vLines: vVal,
+        useSeparateHV: panelUseSeparateHV.checked,
+        enableMode: panelEnableMode.checked,
+        showGuideLines: panelShowGuideLines.checked,
+        showHorizontalLines: panelShowHorizontalLines.checked,
+        showEqualBrightnessLines: panelShowEqualBrightnessLines.checked,
+        colorConfig: configVal,
+        customParams: normalizeCustomParams(customParams),
+        guideLineOpacity: Math.max(
+          horizontalOpacityVal,
+          equalBrightnessOpacityVal,
+        ),
+        horizontalLineOpacity: horizontalOpacityVal,
+        equalBrightnessLineOpacity: equalBrightnessOpacityVal,
+        hueLines: hueVal,
+      };
+
+      console.log("✅ 面板保存设置:", newSettings);
+      saveSettings(newSettings);
+      activeSettings = newSettings;
+      setMode(activeSettings.enableMode);
+      updateGuideLinesBtnState();
+      await LUT.init(configVal);
+      scheduleVisualUpdate(true);
+      settingsBeforePanel = null;
+      switchToView("showPicker");
+    });
+  }
+
+  let draggingSV = false,
+    draggingHue = false;
+  svArea.addEventListener("mousedown", (e) => {
+    draggingSV = true;
+    svAreaRect = svArea.getBoundingClientRect();
+    updateSVFromMouse(e);
+    e.preventDefault();
+  });
+  hueArea.addEventListener("mousedown", (e) => {
+    draggingHue = true;
+    hueAreaRect = hueArea.getBoundingClientRect();
+    updateHueFromMouse(e);
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (draggingSV) updateSVFromMouse(e);
+    else if (draggingHue) updateHueFromMouse(e);
+  });
+  document.addEventListener("mouseup", async () => {
+    if (draggingSV || draggingHue) {
+      isUpdatingFromPlugin = true;
+      const rgb = hsvToRgb(currentHue, currentS, currentV);
+      try {
+        await core.executeAsModal(
+          async () => {
+            if (activeTarget === "foreground") {
+              const newColor = app.foregroundColor;
+              newColor.rgb.red = rgb.r;
+              newColor.rgb.green = rgb.g;
+              newColor.rgb.blue = rgb.b;
+              app.foregroundColor = newColor;
+            } else {
+              const newColor = app.backgroundColor;
+              newColor.rgb.red = rgb.r;
+              newColor.rgb.green = rgb.g;
+              newColor.rgb.blue = rgb.b;
+              app.backgroundColor = newColor;
+            }
+          },
+          {
+            commandName:
+              activeTarget === "foreground"
+                ? "Set Foreground Color"
+                : "Set Background Color",
+          },
+        );
+      } catch (e) {
+        console.error("Set PS color failed:", e);
+      }
+      setTimeout(() => {
+        isUpdatingFromPlugin = false;
+      }, 200);
+    }
+    draggingSV = false;
+    draggingHue = false;
+    svAreaRect = null;
+    hueAreaRect = null;
+  });
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => {
+      resizeCanvases();
+    });
+    ro.observe(svArea);
+    ro.observe(hueArea);
+  }
+  // Keep focus behavior under Photoshop's control so native shortcuts remain available.
+
+  /* Photoshop owns keyboard shortcuts; the panel does not intercept them. */
+  /*
+    if (e.isComposing) return;
+    if (e.key === "Backspace" && e.altKey && !e.metaKey && !e.repeat) {
+      console.log("DEBUG opt+backspace event", {
+        key: e.key,
+        code: e.code,
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey,
+        ctrlKey: e.ctrlKey,
+        repeat: e.repeat,
+      });
+    }
+    if (e.key.toLowerCase() === "x" && !e.repeat) {
+      if (!isDocumentOpen()) return;
+      swapForegroundBackgroundColors();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    if (e.key === "Backspace" && e.altKey && !e.metaKey && !e.repeat) {
+      console.log("🔍 [Event] opt+backspace 按下", {
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+      });
+      if (!isDocumentOpen()) {
+        console.log("❌ [Check] opt+backspace 忽略: 没有打开的文档");
+        return;
+      }
+      console.log(
+        "➡️ [Action] opt+backspace 准备调用 fillCurrentLayerWithForeground",
+      );
+      e.preventDefault();
+      e.stopPropagation();
+
+      fillCurrentLayerWithForeground().catch((err) => {
+        console.error("🔥 [Error] opt+backspace 执行过程出错:", err);
+      });
+      return;
+    }
+
+    if (
+      e.key === "Backspace" &&
+      e.shiftKey &&
+      !e.altKey &&
+      !e.metaKey &&
+      !e.repeat
+    ) {
+      console.log("🔍 [Event] shift+backspace 按下", {
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        shiftKey: e.shiftKey,
+      });
+      if (!isDocumentOpen()) {
+        console.log("❌ [Check] shift+backspace 忽略: 没有打开的文档");
+        return;
+      }
+      console.log(
+        "➡️ [Action] shift+backspace 准备调用 fillCurrentLayerWithForeground",
+      );
+      e.preventDefault();
+      e.stopPropagation();
+
+      fillCurrentLayerWithForeground().catch((err) => {
+        console.error("🔥 [Error] shift+backspace 执行过程出错:", err);
+      });
+      return;
+    }
+
+    if (e.key === "Backspace" && e.metaKey && !e.altKey && !e.repeat) {
+      console.log("🔍 [Event] cmd+backspace 按下", {
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+      });
+      if (!isDocumentOpen()) {
+        console.log("❌ [Check] cmd+backspace 忽略: 没有打开的文档");
+        return;
+      }
+      console.log(
+        "➡️ [Action] cmd+backspace 准备调用 fillCurrentLayerWithBackground",
+      );
+      e.preventDefault();
+      e.stopPropagation();
+
+      fillCurrentLayerWithBackground().catch((err) => {
+        console.error("🔥 [Error] cmd+backspace 执行过程出错:", err);
+      });
+      return;
+    }
+
+    if (matchShortcut(e, activeSettings.shortcut1)) {
+      if (e.repeat) return;
+      if (s1UpTimer) {
+        clearTimeout(s1UpTimer);
+        s1UpTimer = null;
+        isS1Down = true;
+        return;
+      }
+      if (!isS1Down) {
+        isS1Down = true;
+        s1DownTime = Date.now();
+        modeBeforeS1 = activeSettings.enableMode;
+        activeSettings.enableMode = !activeSettings.enableMode;
+        saveSettings(activeSettings);
+        setMode(activeSettings.enableMode);
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (matchShortcut(e, activeSettings.shortcut2)) {
+      if (e.repeat) return;
+      if (s2UpTimer) {
+        clearTimeout(s2UpTimer);
+        s2UpTimer = null;
+        isS2Down = true;
+        return;
+      }
+      if (!isS2Down) {
+        isS2Down = true;
+        s2DownTime = Date.now();
+        guideLinesBeforeS2 = activeSettings.showGuideLines;
+        activeSettings.showGuideLines = !activeSettings.showGuideLines;
+        saveSettings(activeSettings);
+        updateGuideLinesBtnState();
+        scheduleVisualUpdate(true);
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+  });
+  document.addEventListener("keyup", (e) => {
+    if (e.isComposing) return;
+    if (matchShortcut(e, activeSettings.shortcut1)) {
+      if (!isS1Down) return;
+      isS1Down = false;
+      const duration = Date.now() - s1DownTime;
+      s1UpTimer = setTimeout(() => {
+        s1UpTimer = null;
+        if (duration >= LONG_PRESS_THRESHOLD) {
+          activeSettings.enableMode = modeBeforeS1;
+          saveSettings(activeSettings);
+          setMode(activeSettings.enableMode);
+        }
+      }, 50);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (matchShortcut(e, activeSettings.shortcut2)) {
+      if (!isS2Down) return;
+      isS2Down = false;
+      const duration = Date.now() - s2DownTime;
+      s2UpTimer = setTimeout(() => {
+        s2UpTimer = null;
+        if (duration >= LONG_PRESS_THRESHOLD) {
+          activeSettings.showGuideLines = guideLinesBeforeS2;
+          saveSettings(activeSettings);
+          updateGuideLinesBtnState();
+          scheduleVisualUpdate(true);
+        }
+      }, 50);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }); */
+  const testFillBtn = document.getElementById("testFillBtn");
+}
+
+async function initHeavy() {
+  resizeCanvases();
+  const initialPreset = activeSettings ? activeSettings.colorConfig : "1";
+  await LUT.init(initialPreset);
+  syncColorsFromPhotoshop();
+  setupColorListener();
+}
+
+function hsvToRgb(h, s, v) {
+  const c = v * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = v - c;
+  let r = 0,
+    g = 0,
+    b = 0;
+  if (h < 60) {
+    r = c;
+    g = x;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+  } else if (h < 180) {
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  return {
+    r: Math.round((r + m) * 255),
+    g: Math.round((g + m) * 255),
+    b: Math.round((b + m) * 255),
+  };
+}
+function rgbToHsv(r, g, b) {
+  ((r /= 255), (g /= 255), (b /= 255));
+  const max = Math.max(r, g, b),
+    min = Math.min(r, g, b);
+  let h = 0,
+    s = 0,
+    v = max;
+  const d = max - min;
+  s = max === 0 ? 0 : d / max;
+  if (max !== min) {
+    switch (max) {
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0);
+        break;
+      case g:
+        h = (b - r) / d + 2;
+        break;
+      case b:
+        h = (r - g) / d + 4;
+        break;
+    }
+    h /= 6;
+  }
+  return { h: h * 360, s, v };
+}
+function perceptualBrightness(h, s, v) {
+  const lutVal = LUT.grayFromHsv(h, s, v);
+  if (lutVal !== null) return Math.round(lutVal);
+  const { r, g, b } = hsvToRgb(h, s, v);
+  return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+}
+
+function drawSVBackground() {
+  const w = svCanvas.width;
+  const h = svCanvas.height;
+  if (w <= 0 || h <= 0) return;
+  const pureRgb = hsvToRgb(currentHue, 1, 1);
+  const pureColorStr = `rgb(${pureRgb.r},${pureRgb.g},${pureRgb.b})`;
+  const hueGrad = svCtx.createLinearGradient(0, 0, w, 0);
+  hueGrad.addColorStop(0, `rgb(255,255,255)`);
+  hueGrad.addColorStop(1, pureColorStr);
+  svCtx.fillStyle = hueGrad;
+  svCtx.fillRect(0, 0, w, h);
+  if (cachedBlackGrad) {
+    svCtx.fillStyle = cachedBlackGrad;
+    svCtx.fillRect(0, 0, w, h);
+  }
+  const settings = activeSettings;
+  if (settings && settings.showGuideLines) {
+    const nH = settings.hLines || 0;
+    const nV = settings.useSeparateHV ? settings.vLines || 0 : nH;
+    svCtx.strokeStyle = "#000";
+    svCtx.lineWidth = 1;
+    const horizontalOpacity =
+      Math.max(0, Math.min(100, settings.horizontalLineOpacity)) / 100;
+    const equalBrightnessOpacity =
+      Math.max(0, Math.min(100, settings.equalBrightnessLineOpacity)) / 100;
+    const enabledOpacities = [];
+    if (settings.showHorizontalLines)
+      enabledOpacities.push(horizontalOpacity);
+    if (settings.showEqualBrightnessLines)
+      enabledOpacities.push(equalBrightnessOpacity);
+    const verticalOpacity =
+      enabledOpacities.length > 0 ? Math.max(...enabledOpacities) : 0;
+
+    if (nH > 0) {
+      svCtx.globalAlpha = verticalOpacity;
+      svCtx.beginPath();
+      const stepH = nH + 1;
+      for (let i = 1; i <= nH; i++) {
+        const ratio = i / stepH;
+        const x = (ratio * w + 0.5) | 0;
+        svCtx.moveTo(x, 0);
+        svCtx.lineTo(x, h);
+      }
+      svCtx.stroke();
+    }
+    if (nV > 0 && settings.showHorizontalLines) {
+      svCtx.globalAlpha = horizontalOpacity;
+      svCtx.beginPath();
+      const stepV = nV + 1;
+      for (let i = 1; i <= nV; i++) {
+        const ratio = i / stepV;
+        const y = ((1 - ratio) * h + 0.5) | 0;
+        svCtx.moveTo(0, y);
+        svCtx.lineTo(w, y);
+      }
+      svCtx.stroke();
+    }
+    if (nV > 0 && settings.showEqualBrightnessLines && LUT.ready) {
+      svCtx.globalAlpha = equalBrightnessOpacity;
+      const stepV = nV + 1;
+      for (let i = 1; i <= nV; i++) {
+        const startV = i / stepV;
+        const targetLineGray = LUT.grayFromHsv(currentHue, 0, startV);
+        if (targetLineGray === null) continue;
+        svCtx.beginPath();
+        svCtx.moveTo(0, (1 - startV) * h);
+        for (let x = 1; x <= w; x++) {
+          const requestedS = x / w;
+          const [lutS, lutV] = LUT.svFromHsg(
+            currentHue,
+            requestedS,
+            targetLineGray,
+          );
+          const plotX = (lutS / 255) * w;
+          const plotY = (1 - lutV / 255) * h;
+          svCtx.lineTo(plotX, plotY);
+          if (lutV >= 255 || lutS >= 255) break;
+        }
+        svCtx.stroke();
+      }
+    }
+    svCtx.globalAlpha = 1.0;
+  }
+}
+
+function scheduleVisualUpdate(needsBgUpdate = false) {
+  if (needsBgUpdate) pendingBgUpdate = true;
+  if (!isBgRedrawScheduled) {
+    isBgRedrawScheduled = true;
+    requestAnimationFrame(() => {
+      if (pendingBgUpdate) {
+        drawSVBackground();
+        pendingBgUpdate = false;
+      }
+      updateMarkers();
+      updateColorInfo();
+      isBgRedrawScheduled = false;
+    });
+  }
+}
+function drawHueBackground() {
+  const w = hueCanvas.width;
+  const h = hueCanvas.height;
+  if (w <= 0 || h <= 0) return;
+  const grad = hueCtx.createLinearGradient(0, h, 0, 0);
+  grad.addColorStop(0, "#ff0000");
+  grad.addColorStop(1 / 6, "#ffff00");
+  grad.addColorStop(2 / 6, "#00ff00");
+  grad.addColorStop(3 / 6, "#00ffff");
+  grad.addColorStop(4 / 6, "#0000ff");
+  grad.addColorStop(5 / 6, "#ff00ff");
+  grad.addColorStop(1, "#ff0000");
+  hueCtx.fillStyle = grad;
+  hueCtx.fillRect(0, 0, w, h);
+
+  const settings = activeSettings;
+  if (settings && settings.showGuideLines) {
+    const nHue = settings.hueLines || 0;
+    if (nHue > 0) {
+      const enabledOpacities = [];
+      if (settings.showHorizontalLines)
+        enabledOpacities.push(settings.horizontalLineOpacity);
+      if (settings.showEqualBrightnessLines)
+        enabledOpacities.push(settings.equalBrightnessLineOpacity);
+      const opacity =
+        enabledOpacities.length > 0
+          ? Math.max(0, Math.min(100, Math.max(...enabledOpacities))) / 100.0
+          : 0;
+      hueCtx.globalAlpha = opacity;
+      hueCtx.strokeStyle = "#000";
+      hueCtx.lineWidth = 1;
+      hueCtx.beginPath();
+      const stepHue = nHue + 1;
+      for (let i = 1; i <= nHue; i++) {
+        const ratio = i / stepHue;
+        const y = (ratio * h + 0.5) | 0;
+        hueCtx.moveTo(0, y);
+        hueCtx.lineTo(w, y);
+      }
+      hueCtx.stroke();
+      hueCtx.globalAlpha = 1.0;
+    }
+  }
+}
+
+function updateMarkers() {
+  const svW = svArea.clientWidth;
+  const svH = svArea.clientHeight;
+  const hueH = hueArea.clientHeight;
+  svMarker.style.transform = `translate(${currentS * svW}px, ${(1 - currentV) * svH}px) translate(-50%, -50%)`;
+  hueMarker.style.transform = `translateY(${(1 - currentHue / 360) * hueH}px) translateY(-50%)`;
+}
+function redraw(needsHueUpdate = true) {
+  if (needsHueUpdate) drawSVBackground();
+  updateMarkers();
+  updateColorInfo();
+}
+
+function updateColorInfo() {
+  const fgRgb = hsvToRgb(foregroundHue, foregroundS, foregroundV);
+  const fgColorStr = `rgb(${fgRgb.r},${fgRgb.g},${fgRgb.b})`;
+  if (fgColorStr !== lastColorStr) {
+    swatch.style.backgroundColor = fgColorStr;
+    lastColorStr = fgColorStr;
+  }
+  const bgRgb = hsvToRgb(backgroundHue, backgroundS, backgroundV);
+  const bgColorStr = `rgb(${bgRgb.r},${bgRgb.g},${bgRgb.b})`;
+  if (bgColorStr !== lastBackgroundStr) {
+    graySwatch.style.backgroundColor = bgColorStr;
+    lastBackgroundStr = bgColorStr;
+  }
+  updateTargetHighlight();
+  const tooVivid = isTooVivid(currentHue, currentS, currentV);
+  if (warningIcon) {
+    warningIcon.style.opacity = tooVivid ? "1" : "0";
+    warningIcon.style.pointerEvents = tooVivid ? "auto" : "none";
+  }
+  if (altSwatch) {
+    altSwatch.style.opacity = tooVivid ? "1" : "0";
+    altSwatch.style.pointerEvents = tooVivid ? "auto" : "none";
+    if (tooVivid) {
+      const altHsv = getAltColor(currentHue, currentS, currentV);
+      const altRgb = hsvToRgb(altHsv.h, altHsv.s, altHsv.v);
+      const altColorStr = `rgb(${altRgb.r},${altRgb.g},${altRgb.b})`;
+      if (altColorStr !== lastAltColorStr) {
+        altSwatch.style.backgroundColor = altColorStr;
+        lastAltColorStr = altColorStr;
+      }
+    }
+  }
+}
+function setCurrentFromActiveTarget() {
+  if (activeTarget === "foreground") {
+    currentHue = foregroundHue;
+    currentS = foregroundS;
+    currentV = foregroundV;
+  } else {
+    currentHue = backgroundHue;
+    currentS = backgroundS;
+    currentV = backgroundV;
+  }
+}
+function syncCurrentToActiveTarget() {
+  if (activeTarget === "foreground") {
+    foregroundHue = currentHue;
+    foregroundS = currentS;
+    foregroundV = currentV;
+  } else {
+    backgroundHue = currentHue;
+    backgroundS = currentS;
+    backgroundV = currentV;
+  }
+}
+function updateTargetHighlight() {
+  if (swatch) {
+    swatch.classList.toggle("active-target", activeTarget === "foreground");
+  }
+  if (graySwatch) {
+    graySwatch.classList.toggle("active-target", activeTarget === "background");
+  }
+}
+function isDocumentOpen() {
+  try {
+    if (app.documents && typeof app.documents.length === "number") {
+      return app.documents.length > 0;
+    }
+    return !!app.activeDocument;
+  } catch (e) {
+    return false;
+  }
+}
+async function swapForegroundBackgroundColors() {
+  const oldFg = {
+    h: foregroundHue,
+    s: foregroundS,
+    v: foregroundV,
+  };
+  foregroundHue = backgroundHue;
+  foregroundS = backgroundS;
+  foregroundV = backgroundV;
+  backgroundHue = oldFg.h;
+  backgroundS = oldFg.s;
+  backgroundV = oldFg.v;
+  if (activeTarget === "foreground") {
+    currentHue = foregroundHue;
+    currentS = foregroundS;
+    currentV = foregroundV;
+  } else {
+    currentHue = backgroundHue;
+    currentS = backgroundS;
+    currentV = backgroundV;
+  }
+  if (cycleState === 1 && LUT.ready) {
+    targetGray = perceptualBrightness(currentHue, currentS, currentV);
+  }
+  isUpdatingFromPlugin = true;
+  try {
+    await core.executeAsModal(
+      async () => {
+        const fgColor = app.foregroundColor;
+        const bgColor = app.backgroundColor;
+        const fgRed = fgColor.rgb.red;
+        const fgGreen = fgColor.rgb.green;
+        const fgBlue = fgColor.rgb.blue;
+        fgColor.rgb.red = bgColor.rgb.red;
+        fgColor.rgb.green = bgColor.rgb.green;
+        fgColor.rgb.blue = bgColor.rgb.blue;
+        bgColor.rgb.red = fgRed;
+        bgColor.rgb.green = fgGreen;
+        bgColor.rgb.blue = fgBlue;
+        app.foregroundColor = fgColor;
+        app.backgroundColor = bgColor;
+      },
+      { commandName: "Swap Foreground Background Colors" },
+    );
+  } catch (e) {
+    console.error("Swap foreground/background color failed:", e);
+  }
+  setTimeout(() => {
+    isUpdatingFromPlugin = false;
+  }, 200);
+  updateTargetHighlight();
+  scheduleVisualUpdate(true);
+}
+async function fillCurrentLayerWithColor(rgb, commandName) {
+  try {
+    const fillCommand = [
+      {
+        _obj: "fill",
+        using: {
+          _enum: "fillContents",
+          _value: "color",
+        },
+        color: {
+          _obj: "RGBColor",
+          red: rgb.red,
+          green: rgb.green,
+          blue: rgb.blue,
+        },
+        mode: {
+          _enum: "blendMode",
+          _value: "normal",
+        },
+        opacity: {
+          _unit: "percentUnit",
+          _value: 100,
+        },
+      },
+    ];
+
+    await core.executeAsModal(
+      async () => {
+        await action.batchPlay(fillCommand, { synchronousExecution: true });
+      },
+      { commandName },
+    );
+  } catch (e) {
+    console.error("Fill layer failed:", commandName, e);
+    throw e;
+  }
+}
+
+function normalizeRgb(value) {
+  return Math.min(255, Math.max(0, Math.round(value)));
+}
+
+async function fillCurrentLayerWithForeground() {
+  const fgRgb = hsvToRgb(foregroundHue, foregroundS, foregroundV);
+  console.log(
+    "🎨 [FG] 提取前景色 HSV:",
+    { h: foregroundHue, s: foregroundS, v: foregroundV },
+    "转换为 RGB:",
+    fgRgb,
+  );
+  try {
+    await fillCurrentLayerWithColor(
+      {
+        red: normalizeRgb(fgRgb.r),
+        green: normalizeRgb(fgRgb.g),
+        blue: normalizeRgb(fgRgb.b),
+      },
+      "Fill Layer with Foreground Color",
+    );
+    console.log("✅ [FG] 前景色填充成功 (使用 FG 的 cmdName)");
+  } catch (err) {
+    console.error("💥 [FG] 前景色填充失败:", err);
+    throw err;
+  }
+}
+
+async function fillCurrentLayerWithBackground() {
+  const bgRgb = hsvToRgb(backgroundHue, backgroundS, backgroundV);
+  console.log(
+    "🎨 [BG] 提取背景色 HSV:",
+    { h: backgroundHue, s: backgroundS, v: backgroundV },
+    "转换为 RGB:",
+    bgRgb,
+  );
+  try {
+    await fillCurrentLayerWithColor(
+      {
+        red: normalizeRgb(bgRgb.r),
+        green: normalizeRgb(bgRgb.g),
+        blue: normalizeRgb(bgRgb.b),
+      },
+      "Fill Layer with Background Color",
+    );
+    console.log("✅ [BG] 背景色填充成功 (使用 BG 的 cmdName)");
+  } catch (err) {
+    console.error("💥 [BG] 背景色填充失败:", err);
+    throw err;
+  }
+}
+
+function syncColorsFromPhotoshop() {
+  try {
+    const fgColor = app.foregroundColor.rgb;
+    const bgColor = app.backgroundColor.rgb;
+    const fgHsv = rgbToHsv(
+      Math.round(fgColor.red),
+      Math.round(fgColor.green),
+      Math.round(fgColor.blue),
+    );
+    const bgHsv = rgbToHsv(
+      Math.round(bgColor.red),
+      Math.round(bgColor.green),
+      Math.round(bgColor.blue),
+    );
+    foregroundHue = fgHsv.h;
+    foregroundS = fgHsv.s;
+    foregroundV = fgHsv.v;
+    backgroundHue = bgHsv.h;
+    backgroundS = bgHsv.s;
+    backgroundV = bgHsv.v;
+    setCurrentFromActiveTarget();
+    scheduleVisualUpdate(true);
+  } catch (e) {
+    console.error("Failed to sync Photoshop colors:", e);
+  }
+}
+function resizeCanvases() {
+  if (!svArea || !hueArea) return;
+  const svRect = svArea.getBoundingClientRect();
+  const hueRect = hueArea.getBoundingClientRect();
+  let svChanged = false,
+    hueChanged = false;
+  if (svRect.width > 0 && svRect.height > 0) {
+    const newW = Math.round(svRect.width);
+    const newH = Math.round(svRect.height);
+    if (svCanvas.width !== newW || svCanvas.height !== newH) {
+      svCanvas.width = newW;
+      svCanvas.height = newH;
+      cachedBlackGrad = svCtx.createLinearGradient(0, 0, 0, newH);
+      cachedBlackGrad.addColorStop(0, "rgba(0,0,0,0)");
+      cachedBlackGrad.addColorStop(1, "rgba(0,0,0,1)");
+      svChanged = true;
+    }
+  }
+  if (hueRect.width > 0 && hueRect.height > 0) {
+    const newW = Math.round(hueRect.width);
+    const newH = Math.round(hueRect.height);
+    if (hueCanvas.width !== newW || hueCanvas.height !== newH) {
+      hueCanvas.width = newW;
+      hueCanvas.height = newH;
+      hueChanged = true;
+    }
+  }
+  if (hueChanged) drawHueBackground();
+  if (svChanged) drawSVBackground();
+  updateMarkers();
+}
+
+function updateSVFromMouse(e) {
+  if (!svAreaRect) return;
+  const s = Math.max(
+    0,
+    Math.min(1, (e.clientX - svAreaRect.left) / svAreaRect.width),
+  );
+  if (cycleState === 1 && LUT.ready) {
+    const [sPrime, vVal] = LUT.svFromHsg(currentHue, s, targetGray);
+    currentS = s;
+    currentV = Math.max(0, Math.min(1, vVal / 255));
+  } else {
+    currentS = s;
+    currentV = Math.max(
+      0,
+      Math.min(1, 1 - (e.clientY - svAreaRect.top) / svAreaRect.height),
+    );
+  }
+  syncCurrentToActiveTarget();
+  scheduleVisualUpdate(false);
+}
+function updateHueFromMouse(e) {
+  if (!hueAreaRect) return;
+  const h = Math.max(
+    0,
+    Math.min(
+      360,
+      (1 - (e.clientY - hueAreaRect.top) / hueAreaRect.height) * 360,
+    ),
+  );
+  if (cycleState === 1 && LUT.ready) {
+    const [sPrime, vVal] = LUT.svFromHsg(h, currentS, targetGray);
+    currentHue = h;
+    currentV = Math.max(0, Math.min(1, vVal / 255));
+  } else {
+    currentHue = h;
+  }
+  syncCurrentToActiveTarget();
+  scheduleVisualUpdate(true);
+}
+
+const onSetEvent = (event) => {
+  if (isUpdatingFromPlugin) return;
+  if (colorCheckTimer) clearTimeout(colorCheckTimer);
+  colorCheckTimer = setTimeout(() => {
+    try {
+      const fgColor = app.foregroundColor.rgb;
+      const bgColor = app.backgroundColor.rgb;
+      const rFg = Math.round(fgColor.red);
+      const gFg = Math.round(fgColor.green);
+      const bFg = Math.round(fgColor.blue);
+      const rBg = Math.round(bgColor.red);
+      const gBg = Math.round(bgColor.green);
+      const bBg = Math.round(bgColor.blue);
+      const fgHsv = rgbToHsv(rFg, gFg, bFg);
+      const bgHsv = rgbToHsv(rBg, gBg, bBg);
+      foregroundHue = fgHsv.h;
+      foregroundS = fgHsv.s;
+      foregroundV = fgHsv.v;
+      backgroundHue = bgHsv.h;
+      backgroundS = bgHsv.s;
+      backgroundV = bgHsv.v;
+      if (activeTarget === "foreground") {
+        currentHue = fgHsv.h;
+        currentS = fgHsv.s;
+        currentV = fgHsv.v;
+      } else {
+        currentHue = bgHsv.h;
+        currentS = bgHsv.s;
+        currentV = bgHsv.v;
+      }
+      if (cycleState === 1)
+        targetGray = perceptualBrightness(currentHue, currentS, currentV);
+      scheduleVisualUpdate(true);
+    } catch (e) {
+      console.error("Error reading Photoshop colors in listener", e);
+    }
+  }, 50);
+};
+async function setupColorListener() {
+  try {
+    await action.addNotificationListener([{ event: "set" }], onSetEvent);
+  } catch (e) {
+    console.error("Failed to add listener", e);
+  }
+}
+
+function getAltColor(h, s, v) {
+  if (!LUT.boundary) return { h: h, s: s * 0.5, v: v * 0.5 };
+  const C = s - v;
+  let bestS = 0,
+    bestDiff = Infinity;
+  const maxSIdx = Math.round(s * 255);
+  for (let s_idx = 0; s_idx <= maxSIdx; s_idx++) {
+    const testS = s_idx / 255.0;
+    const testV = LUT.boundaryFromHs(h, testS);
+    const diff = Math.abs(testS - testV - C);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestS = testS;
+    }
+  }
+  const v_alt = LUT.boundaryFromHs(h, bestS);
+  return { h: h, s: bestS, v: v_alt };
+}
+function isTooVivid(h, s, v) {
+  if (!LUT.boundary) return s + v > 1.5;
+  const maxSafeV = LUT.boundaryFromHs(h, s);
+  return v > maxSafeV;
+}

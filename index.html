@@ -1,0 +1,461 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="viewPicker">
+      <div class="pickerContainer">
+        <div class="swatch" id="swatch"></div>
+        <div id="warningIcon" class="warning-icon"></div>
+        <div id="altSwatch" class="alt-swatch"></div>
+        <div class="gray-swatch" id="graySwatch"></div>
+        <div class="svArea" id="svArea">
+          <canvas id="svCanvas"></canvas>
+          <div id="svMarker" class="marker-circle"></div>
+        </div>
+        <div class="hueArea" id="hueArea">
+          <canvas id="hueCanvas"></canvas>
+          <div id="hueMarker" class="marker-hue"></div>
+        </div>
+      </div>
+    </div>
+    <div id="viewSettings">
+      <div class="settings-panel-container">
+        <h2 class="panel-title">Settings</h2>
+        <p class="panel-desc" id="panel_desc"></p>
+        <div class="setting-group setting-row">
+          <input type="checkbox" id="panel_enableMode" class="panel-checkbox" />
+          <label for="panel_enableMode" class="panel-label-row"
+            >启用 LUT 模式</label
+          >
+        </div>
+        <div class="setting-group setting-row">
+          <input
+            type="checkbox"
+            id="panel_showGuideLines"
+            class="panel-checkbox"
+          />
+          <label for="panel_showGuideLines" class="panel-label-row"
+            >显示指示线</label
+          >
+        </div>
+        <div class="setting-group setting-row">
+          <input
+            type="checkbox"
+            id="panel_useSeparateHV"
+            class="panel-checkbox"
+          />
+          <label for="panel_useSeparateHV" class="panel-label-row"
+            >分别设置 S/V 线数</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>S 方向指示线数 (0 - 15):</label>
+          <input type="number" id="panel_hLines" min="0" max="15" step="1" />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group" id="panel_vLinesGroup">
+          <label>V 方向指示线数 (0 - 15):</label>
+          <input
+            type="number"
+            id="panel_vLines"
+            min="0"
+            max="15"
+            step="1"
+            disabled
+          />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group">
+          <label>Hue 方向指示线数 (0 - 15):</label>
+          <input type="number" id="panel_hueLines" min="0" max="15" step="1" />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group setting-row">
+          <input
+            type="checkbox"
+            id="panel_showHorizontalLines"
+            class="panel-checkbox"
+          />
+          <label for="panel_showHorizontalLines" class="panel-label-row"
+            >显示水平线</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>水平线不透明度 (0 - 100%):</label>
+          <input
+            type="number"
+            id="panel_horizontalLineOpacity"
+            min="0"
+            max="100"
+            step="1"
+          />
+          <span class="hint">0为全透明，100为全黑</span>
+        </div>
+        <div class="setting-group setting-row">
+          <input
+            type="checkbox"
+            id="panel_showEqualBrightnessLines"
+            class="panel-checkbox"
+          />
+          <label for="panel_showEqualBrightnessLines" class="panel-label-row"
+            >显示等明度线</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>等明度线不透明度 (0 - 100%):</label>
+          <input
+            type="number"
+            id="panel_equalBrightnessLineOpacity"
+            min="0"
+            max="100"
+            step="1"
+          />
+          <span class="hint">0为全透明，100为全黑</span>
+        </div>
+        <div class="setting-group" style="margin-top: 4px">
+          <label>颜色配置:</label>
+          <div class="custom-dropdown" id="panel_updateColorConfigDropdown">
+            <div class="dropdown-selected">
+              <span class="selected-text">1</span>
+            </div>
+            <div class="dropdown-options">
+              <div class="dropdown-option" data-value="1">默认</div>
+              <div class="dropdown-option" data-value="2">较亮</div>
+              <div class="dropdown-option" data-value="3">较暗</div>
+              <div class="dropdown-divider"></div>
+              <div class="dropdown-option" data-value="4">Dot Gain 15%</div>
+              <div class="dropdown-option" data-value="5">Gray Gamma 2.2</div>
+              <div class="dropdown-divider"></div>
+              <div class="dropdown-option" data-value="6">自定义</div>
+            </div>
+          </div>
+        </div>
+        <div class="custom-params-panel" id="panel_customParamsGroup">
+          <div class="custom-params-title">自定义灰度参数</div>
+          <div class="custom-param-row">
+            <label for="panel_customR">R</label>
+            <input
+              type="range"
+              id="panel_customR"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="panel_customRValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="panel_customY">Y</label>
+            <input
+              type="range"
+              id="panel_customY"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="panel_customYValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="panel_customG">G</label>
+            <input
+              type="range"
+              id="panel_customG"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="panel_customGValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="panel_customC">C</label>
+            <input
+              type="range"
+              id="panel_customC"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="panel_customCValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="panel_customB">B</label>
+            <input
+              type="range"
+              id="panel_customB"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="panel_customBValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="panel_customM">M</label>
+            <input
+              type="range"
+              id="panel_customM"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="panel_customMValue">100</span>
+          </div>
+        </div>
+        <div class="dialog-buttons" style="margin-top: auto; padding-top: 16px">
+          <button type="button" id="panel_cancelBtn" uxp-variant="primary">
+            取消
+          </button>
+          <button type="button" id="panel_saveBtn" uxp-variant="cta">
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+    <dialog id="settingsDialog" tabindex="-1">
+      <form
+        method="dialog"
+        style="display: flex; flex-direction: column; gap: 16px; width: 100%"
+      >
+        <h2 style="margin: 0; font-size: 18px; color: #fff">Settings</h2>
+        <p
+          id="dialog_desc"
+          style="
+            margin: 0 0 16px 0;
+            font-size: 11px;
+            color: #999;
+            line-height: 1.4;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #444;
+          "
+        ></p>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input
+            type="checkbox"
+            id="dlg_enableMode"
+            style="
+              width: 16px;
+              height: 16px;
+              margin: 0;
+              cursor: pointer;
+              accent-color: #0d99ff;
+            "
+          />
+          <label for="dlg_enableMode" style="margin: 0; cursor: pointer"
+            >启用 LUT 模式</label
+          >
+        </div>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input
+            type="checkbox"
+            id="dlg_showGuideLines"
+            style="
+              width: 16px;
+              height: 16px;
+              margin: 0;
+              cursor: pointer;
+              accent-color: #0d99ff;
+            "
+          />
+          <label for="dlg_showGuideLines" style="margin: 0; cursor: pointer"
+            >显示指示线</label
+          >
+        </div>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input
+            type="checkbox"
+            id="dlg_useSeparateHV"
+            style="
+              width: 16px;
+              height: 16px;
+              margin: 0;
+              cursor: pointer;
+              accent-color: #0d99ff;
+            "
+          />
+          <label for="dlg_useSeparateHV" style="margin: 0; cursor: pointer"
+            >分别设置 S/V 线数</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>S 方向指示线数 (0 - 15):</label>
+          <input type="number" id="dlg_hLines" min="0" max="15" step="1" />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group" id="vLinesGroup">
+          <label>V 方向指示线数 (0 - 15):</label>
+          <input
+            type="number"
+            id="dlg_vLines"
+            min="0"
+            max="15"
+            step="1"
+            disabled
+          />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div class="setting-group">
+          <label>Hue 方向指示线数 (0 - 15):</label>
+          <input type="number" id="dlg_hueLines" min="0" max="15" step="1" />
+          <span class="hint">仅允许输入 0 到 15 的整数</span>
+        </div>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input type="checkbox" id="dlg_showHorizontalLines" />
+          <label for="dlg_showHorizontalLines" style="margin: 0; cursor: pointer"
+            >显示水平线</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>水平线不透明度 (0 - 100%):</label>
+          <input
+            type="number"
+            id="dlg_horizontalLineOpacity"
+            min="0"
+            max="100"
+            step="1"
+          />
+          <span class="hint">0为全透明，100为全黑</span>
+        </div>
+        <div
+          class="setting-group"
+          style="flex-direction: row; align-items: center; gap: 8px"
+        >
+          <input type="checkbox" id="dlg_showEqualBrightnessLines" />
+          <label
+            for="dlg_showEqualBrightnessLines"
+            style="margin: 0; cursor: pointer"
+            >显示等明度线</label
+          >
+        </div>
+        <div class="setting-group">
+          <label>等明度线不透明度 (0 - 100%):</label>
+          <input
+            type="number"
+            id="dlg_equalBrightnessLineOpacity"
+            min="0"
+            max="100"
+            step="1"
+          />
+          <span class="hint">0为全透明，100为全黑</span>
+        </div>
+        <div class="setting-group" style="margin-top: 4px">
+          <label>颜色配置:</label>
+          <div class="custom-dropdown" id="dlg_updateColorConfigDropdown">
+            <div class="dropdown-selected">
+              <span class="selected-text">1</span>
+            </div>
+            <div class="dropdown-options">
+              <div class="dropdown-option" data-value="1">默认</div>
+              <div class="dropdown-option" data-value="2">较亮</div>
+              <div class="dropdown-option" data-value="3">较暗</div>
+              <div class="dropdown-divider"></div>
+              <div class="dropdown-option" data-value="4">Dot Gain 15%</div>
+              <div class="dropdown-option" data-value="5">Gray Gamma 2.2</div>
+              <div class="dropdown-divider"></div>
+              <div class="dropdown-option" data-value="6">自定义</div>
+            </div>
+          </div>
+        </div>
+        <div class="custom-params-panel" id="dlg_customParamsGroup">
+          <div class="custom-params-title">自定义灰度参数</div>
+          <div class="custom-param-row">
+            <label for="dlg_customR">R</label>
+            <input
+              type="range"
+              id="dlg_customR"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="dlg_customRValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="dlg_customY">Y</label>
+            <input
+              type="range"
+              id="dlg_customY"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="dlg_customYValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="dlg_customG">G</label>
+            <input
+              type="range"
+              id="dlg_customG"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="dlg_customGValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="dlg_customC">C</label>
+            <input
+              type="range"
+              id="dlg_customC"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="dlg_customCValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="dlg_customB">B</label>
+            <input
+              type="range"
+              id="dlg_customB"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="dlg_customBValue">100</span>
+          </div>
+          <div class="custom-param-row">
+            <label for="dlg_customM">M</label>
+            <input
+              type="range"
+              id="dlg_customM"
+              min="1"
+              max="100"
+              step="1"
+              value="100"
+            />
+            <span class="custom-param-value" id="dlg_customMValue">100</span>
+          </div>
+        </div>
+        <div class="dialog-buttons">
+          <button type="button" id="dlg_cancelBtn" uxp-variant="primary">
+            取消
+          </button>
+          <button type="button" id="dlg_saveBtn" uxp-variant="cta">保存</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="index.js"></script>
+  </body>
+</html>
